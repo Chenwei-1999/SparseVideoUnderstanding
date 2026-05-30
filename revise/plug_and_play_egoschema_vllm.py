@@ -80,6 +80,8 @@ UNSTRUCTURED_SYSTEM_PROMPT = (
 )
 
 from revise.pnp_prompts import SYSTEM_PROMPT as DEFAULT_SYSTEM_PROMPT
+from revise.pnp_utils import format_mc_question as _format_question
+from revise.pnp_utils import start_vllm_server as _shared_start_vllm_server
 from revise.pnp_utils import (
     ANSWER_RE,
     SELECT_RE,

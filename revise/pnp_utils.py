@@ -169,6 +169,39 @@ def retry_feedback_text(feedback: str, *, force_answer: bool, force_instructions
     return f"{feedback}\nPlease respond with one of the required formats."
 
 
+# Forced-answer instruction strings shared by the launchers' retry nudges.
+# POHR variant (NExT-QA): reminds the model of the P/O/H/U/R summary order.
+FORCE_ANSWER_INSTRUCTIONS_POHR = (
+    "Output ONLY <think>...</think> then <answer>LETTER</answer>. "
+    "In <summarize>, include P/O/H/U/R in that exact order. "
+    "In <answer>, LETTER must be a single option letter (e.g., A/B/C/D/E)."
+)
+# Simple variant (Video-MME / LVBench-HF): no summarize reminder.
+FORCE_ANSWER_INSTRUCTIONS_SIMPLE = (
+    "You MUST answer now. Output <think>...</think> then <answer>LETTER</answer>."
+)
+
+
+def format_mc_question(question: str, choices: list[str]) -> str:
+    """Format a multiple-choice question with a REVISE answer-format reminder.
+
+    Shared by the NExT-QA and EgoSchema launchers, which had byte-identical
+    copies. Distinct from :func:`format_question_block` (no trailing protocol
+    reminder) — kept separate rather than overloaded with a flag, since the two
+    call sites genuinely want different trailing text.
+    """
+    lines = [f"Question: {question.strip()}", "", "Options:"]
+    for idx, choice in enumerate(choices):
+        letter = OPTION_LABELS[idx] if idx < len(OPTION_LABELS) else str(idx)
+        lines.append(f"{letter}. {choice.strip()}")
+    lines.append("")
+    lines.append(
+        "Answer with one of the option letters. Begin every reply with <think>...</think>; "
+        "on a Select round add <summarize> then <select>; on the Answer round add <answer>LETTER</answer>."
+    )
+    return "\n".join(lines)
+
+
 def _contains_auto_map(value: Any) -> bool:
     if isinstance(value, dict):
         if "auto_map" in value:

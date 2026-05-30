@@ -357,11 +357,7 @@ def _retry_feedback_text(feedback: str, *, force_answer: bool = False) -> str:
     return retry_feedback_text(
         feedback,
         force_answer=force_answer,
-        force_instructions=(
-            "Output ONLY <think>...</think> then <answer>LETTER</answer>. "
-            "In <summarize>, include P/O/H/U/R in that exact order. "
-            "In <answer>, LETTER must be a single option letter (e.g., A/B/C/D/E)."
-        ),
+        force_instructions=_FORCE_ANSWER_INSTRUCTIONS,
     )
 
 
