@@ -28,10 +28,21 @@ from typing import Any, Optional
 import requests
 from PIL import Image
 
-try:
-    import wandb  # type: ignore
-except Exception:  # pragma: no cover
-    wandb = None
+def _load_wandb() -> Any:
+    """Import wandb lazily, returning None if it is unavailable.
+
+    wandb costs ~1.4s to import and is only needed when ``--use-wandb`` is set,
+    so importing it at module load taxed every importer of pnp_utils -- all six
+    eval scripts, the whole test suite, ``--help``, and the paper-suite command
+    builder -- for a feature most invocations never use. After the first call
+    ``import wandb`` is just a cheap sys.modules lookup.
+    """
+    try:
+        import wandb  # type: ignore
+
+        return wandb
+    except Exception:  # pragma: no cover
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -896,7 +907,10 @@ def maybe_init_wandb(args: argparse.Namespace, run_config: dict[str, Any]) -> An
     Expects *args* to have: ``use_wandb``, ``wandb_project``, ``wandb_entity``,
     ``wandb_name``, ``wandb_group``, ``wandb_tags``, ``wandb_mode``.
     """
-    if not getattr(args, "use_wandb", False) or wandb is None:
+    if not getattr(args, "use_wandb", False):
+        return None
+    wandb = _load_wandb()
+    if wandb is None:
         return None
 
     def _has_wandb_credentials() -> bool:
@@ -932,7 +946,10 @@ def maybe_init_wandb(args: argparse.Namespace, run_config: dict[str, Any]) -> An
 
 def wandb_log(run: Any, metrics: dict[str, Any], step: int) -> None:
     """Log metrics to wandb (no-op if *run* is None)."""
-    if run is None or wandb is None:
+    if run is None:
+        return
+    wandb = _load_wandb()
+    if wandb is None:
         return
     wandb.log(metrics, step=step)
 
