@@ -560,6 +560,26 @@ class NextQADataset:
     def sample_unseen_frames(self, frame_count: int, seen: set[int], k: int, rng: random.Random) -> list[int]:
         return _sample_unseen_frames(frame_count, seen, k, rng=rng)
 
+    def initial_frame_indices(self, sample: NextQASample, frame_count: int, cfg: LoopConfig) -> list[int]:
+        _ = sample
+        return sample_uniform_indices(frame_count, cfg.max_frames_per_round)
+
+    def candidate_frame_indices(
+        self,
+        sample: NextQASample,
+        *,
+        frame_count: int,
+        seen_frames: list[int],
+        k: int,
+        rng: random.Random,
+    ) -> list[int]:
+        _ = sample
+        return propose_candidate_frames(frame_count=frame_count, seen=set(seen_frames), k=k, rng=rng)
+
+    def fallback_frame_indices(self, sample: NextQASample, frame_count: int, k: int, cfg: LoopConfig) -> list[int]:
+        _ = sample, cfg
+        return sample_uniform_indices(frame_count, k)
+
     def retry_feedback_text(
         self,
         reason: str,
@@ -766,6 +786,18 @@ class NextQADataset:
     def should_fail_on_empty_images(self, cfg: LoopConfig) -> bool:
         _ = cfg
         return False
+
+    def should_count_exhausted_invalid_as_retry(self, reason: str) -> bool:
+        _ = reason
+        return False
+
+    def should_clear_frame_plan_on_exhausted_invalid(self, reason: str) -> bool:
+        _ = reason
+        return False
+
+    def should_retry_invalid_output(self, reason: str) -> bool:
+        _ = reason
+        return True
 
 
 class VllmHttpBackend:

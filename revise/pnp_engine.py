@@ -8,12 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from revise.pnp_protocols import Backend, Dataset, LoopConfig, RunStats
-from revise.pnp_utils import (
-    maybe_log_jsonl,
-    propose_candidate_frames,
-    sample_uniform_indices,
-    truncate_text,
-)
+from revise.pnp_utils import maybe_log_jsonl, truncate_text
 
 
 @dataclass
@@ -108,18 +103,28 @@ def run_sample(
             key = dataset.caption_key_for_frame_index(int(idx), fps)
         return video_captions.get(int(key)) or "[no caption]"
 
-    init_frames = sample_uniform_indices(frame_count, cfg.max_frames_per_round)
+    init_frames = dataset.initial_frame_indices(sample, frame_count, cfg)
     next_frames = [int(i) for i in init_frames if i >= 0]
     answer_letter: Optional[str] = None
     last_user_text: Optional[str] = None
     last_images: list[Any] = []
     last_frames: list[int] = []
 
+    def _count_exhausted_invalid_as_retry(reason: str) -> None:
+        if dataset.should_count_exhausted_invalid_as_retry(reason):
+            stats.total_retries += 1
+
+    def _should_clear_frame_plan(reason: str) -> bool:
+        return dataset.should_clear_frame_plan_on_exhausted_invalid(reason)
+
+    def _can_retry(reason: str, retry_idx: int) -> bool:
+        return retry_idx < int(cfg.max_retries_per_round) and dataset.should_retry_invalid_output(reason)
+
     for round_idx in range(1, cfg.max_rounds + 1):
         # Frames shown in this round.
         frames_this_round = [i for i in next_frames if i not in seen_frames]
         if not frames_this_round:
-            frames_this_round = sample_uniform_indices(frame_count, 1)
+            frames_this_round = dataset.fallback_frame_indices(sample, frame_count, 1, cfg)
         frames_this_round = frames_this_round[: cfg.max_frames_per_round]
         for i in frames_this_round:
             if i not in seen_frames:
@@ -128,9 +133,10 @@ def run_sample(
         candidate_next_frames: list[int] = []
         if getattr(cfg, "use_candidate_frames", False):
             k = cfg.candidate_k if cfg.candidate_k is not None else max(12, cfg.max_frames_per_round * 4)
-            candidate_next_frames = propose_candidate_frames(
+            candidate_next_frames = dataset.candidate_frame_indices(
+                sample,
                 frame_count=frame_count,
-                seen=set(seen_frames),
+                seen_frames=seen_frames,
                 k=k,
                 rng=rng,
             )
@@ -214,6 +220,10 @@ def run_sample(
                     )
                 else:
                     requested_mapped_frames = requested_raw_frames
+            answer_for_log = dataset.parse_answer(raw)
+            answer_letter_for_log = (
+                dataset.normalize_answer(sample, answer_for_log) if answer_for_log else None
+            )
 
             maybe_log_jsonl(
                 cfg.log_jsonl,
@@ -242,6 +252,7 @@ def run_sample(
                     "system_prompt": system_prompt,
                     "user_text": attempt_user_text,
                     "raw_output": raw,
+                    "answer_letter": answer_letter_for_log,
                 },
             )
 
@@ -253,7 +264,7 @@ def run_sample(
             if think is None:
                 stats.invalid_outputs += 1
                 terminated_reason = "missing_think"
-                if retry_idx < int(cfg.max_retries_per_round):
+                if _can_retry("missing_think", retry_idx):
                     stats.total_retries += 1
                     retry_feedback = dataset.retry_feedback_text(
                         "missing_think",
@@ -264,10 +275,14 @@ def run_sample(
                     )
                     attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                     continue
+                _count_exhausted_invalid_as_retry("missing_think")
                 if cfg.strict_actions:
                     stats.invalid_action_terminated += 1
                     terminated_invalid_action = True
                     answer_letter = None
+                    break
+                if _should_clear_frame_plan("missing_think"):
+                    next_frames = []
                     break
                 # Fall back to the usual next_frames heuristic.
                 stats.fallback_frames_used += 1
@@ -277,7 +292,7 @@ def run_sample(
                 next_frames = (
                     requested[: cfg.max_frames_per_round]
                     if requested
-                    else sample_uniform_indices(frame_count, 1)
+                    else dataset.fallback_frame_indices(sample, frame_count, 1, cfg)
                 )
                 break
 
@@ -287,7 +302,7 @@ def run_sample(
                 if answer_letter is None:
                     stats.invalid_outputs += 1
                     terminated_reason = "invalid_answer_letter"
-                    if retry_idx < int(cfg.max_retries_per_round):
+                    if _can_retry("invalid_answer_letter", retry_idx):
                         stats.total_retries += 1
                         retry_feedback = dataset.retry_feedback_text(
                             "invalid_answer_letter",
@@ -298,9 +313,14 @@ def run_sample(
                         )
                         attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                         continue
+                    _count_exhausted_invalid_as_retry("invalid_answer_letter")
                     if cfg.strict_actions:
                         stats.invalid_action_terminated += 1
                         terminated_invalid_action = True
+                        answer_letter = None
+                        break
+                    if _should_clear_frame_plan("invalid_answer_letter"):
+                        next_frames = []
                         answer_letter = None
                         break
                     # Non-strict: ignore the invalid answer and continue with a fallback frame.
@@ -309,14 +329,14 @@ def run_sample(
                         frame_count, set(seen_frames), cfg.max_frames_per_round, rng=rng
                     )
                     if not next_frames:
-                        next_frames = sample_uniform_indices(frame_count, 1)
+                        next_frames = dataset.fallback_frame_indices(sample, frame_count, 1, cfg)
                     answer_letter = None
                     break
 
                 if bool(cfg.answer_only_final_round) and round_idx < cfg.max_rounds:
                     stats.invalid_outputs += 1
                     terminated_reason = "early_answer_disallowed"
-                    if retry_idx < int(cfg.max_retries_per_round):
+                    if _can_retry("early_answer_disallowed", retry_idx):
                         stats.total_retries += 1
                         retry_feedback = dataset.retry_feedback_text(
                             "early_answer_disallowed",
@@ -328,9 +348,14 @@ def run_sample(
                         attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                         answer_letter = None
                         continue
+                    _count_exhausted_invalid_as_retry("early_answer_disallowed")
                     if cfg.strict_actions:
                         stats.invalid_action_terminated += 1
                         terminated_invalid_action = True
+                        answer_letter = None
+                        break
+                    if _should_clear_frame_plan("early_answer_disallowed"):
+                        next_frames = []
                         answer_letter = None
                         break
                     # Non-strict: ignore the early answer and continue with a fallback frame request.
@@ -339,7 +364,7 @@ def run_sample(
                         frame_count, set(seen_frames), cfg.max_frames_per_round, rng=rng
                     )
                     if not next_frames:
-                        next_frames = sample_uniform_indices(frame_count, 1)
+                        next_frames = dataset.fallback_frame_indices(sample, frame_count, 1, cfg)
                     answer_letter = None
                     break
 
@@ -354,7 +379,7 @@ def run_sample(
             if frames_text is None:
                 stats.invalid_outputs += 1
                 terminated_reason = "missing_frames_tag"
-                if retry_idx < int(cfg.max_retries_per_round):
+                if _can_retry("missing_frames_tag", retry_idx):
                     stats.total_retries += 1
                     retry_feedback = dataset.retry_feedback_text(
                         "missing_frames_tag",
@@ -365,18 +390,22 @@ def run_sample(
                     )
                     attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                     continue
+                _count_exhausted_invalid_as_retry("missing_frames_tag")
                 if cfg.strict_actions:
                     stats.invalid_action_terminated += 1
                     terminated_invalid_action = True
                     answer_letter = None
                     break
-                next_frames = sample_uniform_indices(frame_count, 1)
+                if _should_clear_frame_plan("missing_frames_tag"):
+                    next_frames = []
+                    break
+                next_frames = dataset.fallback_frame_indices(sample, frame_count, 1, cfg)
                 break
 
             if not dataset.is_select_summary_valid(summary, seen_count=len(seen_frames)):
                 stats.invalid_outputs += 1
                 terminated_reason = "invalid_select_summary"
-                if retry_idx < int(cfg.max_retries_per_round):
+                if _can_retry("invalid_select_summary", retry_idx):
                     stats.total_retries += 1
                     retry_feedback = dataset.retry_feedback_text(
                         "invalid_select_summary",
@@ -387,6 +416,7 @@ def run_sample(
                     )
                     attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                     continue
+                _count_exhausted_invalid_as_retry("invalid_select_summary")
                 if cfg.strict_actions and dataset.should_terminate_on_invalid_summary(cfg):
                     stats.invalid_action_terminated += 1
                     terminated_invalid_action = True
@@ -395,7 +425,7 @@ def run_sample(
             if dataset.is_summary_stale(summary, seen_count=len(seen_frames)):
                 stats.invalid_outputs += 1
                 terminated_reason = "stale_select_summary"
-                if retry_idx < int(cfg.max_retries_per_round):
+                if _can_retry("stale_select_summary", retry_idx):
                     stats.total_retries += 1
                     retry_feedback = dataset.retry_feedback_text(
                         "stale_select_summary",
@@ -406,6 +436,7 @@ def run_sample(
                     )
                     attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                     continue
+                _count_exhausted_invalid_as_retry("stale_select_summary")
                 if cfg.strict_actions and dataset.should_terminate_on_invalid_summary(cfg):
                     stats.invalid_action_terminated += 1
                     terminated_invalid_action = True
@@ -415,7 +446,7 @@ def run_sample(
             if (not bool(cfg.use_candidate_frame_ids)) and dataset.select_has_range_syntax(frames_text):
                 stats.invalid_outputs += 1
                 terminated_reason = "frames_range_syntax"
-                if retry_idx < int(cfg.max_retries_per_round):
+                if _can_retry("frames_range_syntax", retry_idx):
                     stats.total_retries += 1
                     retry_feedback = dataset.retry_feedback_text(
                         "frames_range_syntax",
@@ -426,6 +457,7 @@ def run_sample(
                     )
                     attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                     continue
+                _count_exhausted_invalid_as_retry("frames_range_syntax")
 
             requested = dataset.parse_select_frames(frames_text)
             if bool(cfg.use_candidate_frame_ids) and candidate_next_frames:
@@ -433,7 +465,7 @@ def run_sample(
                 if mapped is None:
                     stats.invalid_outputs += 1
                     terminated_reason = "frames_out_of_range"
-                    if retry_idx < int(cfg.max_retries_per_round):
+                    if _can_retry("frames_out_of_range", retry_idx):
                         stats.total_retries += 1
                         retry_feedback = dataset.retry_feedback_text(
                             "frames_out_of_range",
@@ -444,10 +476,14 @@ def run_sample(
                         )
                         attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                         continue
+                    _count_exhausted_invalid_as_retry("frames_out_of_range")
                     if cfg.strict_actions and not bool(cfg.fallback_on_invalid_candidate_ids):
                         stats.invalid_action_terminated += 1
                         terminated_invalid_action = True
                         answer_letter = None
+                        break
+                    if _should_clear_frame_plan("frames_out_of_range"):
+                        next_frames = []
                         break
                     # Be forgiving: fall back to heuristic sampling instead of hard-terminating.
                     stats.fallback_frames_used += 1
@@ -459,7 +495,7 @@ def run_sample(
                     next_frames = (
                         requested[: cfg.max_frames_per_round]
                         if requested
-                        else sample_uniform_indices(frame_count, 1)
+                        else dataset.fallback_frame_indices(sample, frame_count, 1, cfg)
                     )
                     break
                 else:
@@ -482,7 +518,7 @@ def run_sample(
                 if select_error == "frames_not_in_candidates":
                     stats.invalid_outputs += 1
                     terminated_reason = "frames_not_in_candidates"
-                    if retry_idx < int(cfg.max_retries_per_round):
+                    if _can_retry("frames_not_in_candidates", retry_idx):
                         stats.total_retries += 1
                         retry_feedback = dataset.retry_feedback_text(
                             "frames_not_in_candidates",
@@ -493,6 +529,7 @@ def run_sample(
                         )
                         attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                         continue
+                    _count_exhausted_invalid_as_retry("frames_not_in_candidates")
                     if cfg.strict_actions:
                         stats.invalid_action_terminated += 1
                         terminated_invalid_action = True
@@ -506,7 +543,7 @@ def run_sample(
             if not requested:
                 stats.invalid_outputs += 1
                 terminated_reason = "invalid_frames"
-                if retry_idx < int(cfg.max_retries_per_round):
+                if _can_retry("invalid_frames", retry_idx):
                     stats.total_retries += 1
                     retry_feedback = dataset.retry_feedback_text(
                         "invalid_frames",
@@ -517,10 +554,14 @@ def run_sample(
                     )
                     attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                     continue
+                _count_exhausted_invalid_as_retry("invalid_frames")
                 if cfg.strict_actions:
                     stats.invalid_action_terminated += 1
                     terminated_invalid_action = True
                     answer_letter = None
+                    break
+                if _should_clear_frame_plan("invalid_frames"):
+                    next_frames = []
                     break
 
                 # Fall back to heuristic sampling.
@@ -531,7 +572,9 @@ def run_sample(
                         frame_count, set(seen_frames), cfg.max_frames_per_round, rng=rng
                     )
                 next_frames = (
-                    requested[: cfg.max_frames_per_round] if requested else sample_uniform_indices(frame_count, 1)
+                    requested[: cfg.max_frames_per_round]
+                    if requested
+                    else dataset.fallback_frame_indices(sample, frame_count, 1, cfg)
                 )
                 break
 
@@ -573,6 +616,8 @@ def run_sample(
             timeout_s=cfg.request_timeout_s,
         )
         stats.total_model_calls += 1
+        answer = dataset.parse_answer(raw)
+        final_answer_letter = dataset.normalize_answer(sample, answer) if answer else None
         maybe_log_jsonl(
             cfg.log_jsonl,
             {
@@ -588,11 +633,12 @@ def run_sample(
                 "system_prompt": forced_system_prompt,
                 "user_text": forced_user_text,
                 "raw_output": raw,
+                "final_answer": final_answer_letter,
+                "answer_letter": final_answer_letter,
             },
         )
-        answer = dataset.parse_answer(raw)
-        if answer:
-            answer_letter = dataset.normalize_answer(sample, answer)
+        if final_answer_letter:
+            answer_letter = final_answer_letter
 
     return SampleOutcome(
         answer_letter=answer_letter,

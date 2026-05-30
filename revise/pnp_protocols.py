@@ -60,6 +60,20 @@ class Dataset(Protocol):
         rng: random.Random,
     ) -> list[int]: ...
 
+    def initial_frame_indices(self, sample: Any, frame_count: int, cfg: "LoopConfig") -> list[int]: ...
+
+    def candidate_frame_indices(
+        self,
+        sample: Any,
+        *,
+        frame_count: int,
+        seen_frames: list[int],
+        k: int,
+        rng: random.Random,
+    ) -> list[int]: ...
+
+    def fallback_frame_indices(self, sample: Any, frame_count: int, k: int, cfg: "LoopConfig") -> list[int]: ...
+
     def retry_feedback_text(
         self,
         reason: str,
@@ -131,6 +145,12 @@ class Dataset(Protocol):
     def should_terminate_on_invalid_summary(self, cfg: "LoopConfig") -> bool: ...
 
     def should_fail_on_empty_images(self, cfg: "LoopConfig") -> bool: ...
+
+    def should_count_exhausted_invalid_as_retry(self, reason: str) -> bool: ...
+
+    def should_clear_frame_plan_on_exhausted_invalid(self, reason: str) -> bool: ...
+
+    def should_retry_invalid_output(self, reason: str) -> bool: ...
 
 
 class Backend(Protocol):
