@@ -40,7 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from revise import pnp_engine
+from revise import pnp_harness
 from revise.pnp_protocols import LoopConfig, RunStats
 from revise.pnp_utils import FORCE_ANSWER_INSTRUCTIONS_SIMPLE as _FORCE_ANSWER_INSTRUCTIONS
 from revise.pnp_utils import (
@@ -780,40 +780,6 @@ def main() -> None:
     samples = samples[start_idx:end_idx]
     if args.max_samples and args.max_samples > 0:
         samples = samples[: args.max_samples]
-    samples = shard_by_video(samples, args.num_shards, args.shard_idx)
-    samples.sort(key=lambda s: (s.video_key, s.uid))
-    if not samples:
-        raise SystemExit("No samples selected (check --split/--start-idx/--max-samples/--sharding).")
-
-    if args.num_shards > 1:
-        suffix = f".shard{args.shard_idx}of{args.num_shards}"
-
-        def _suffix_path(path: str) -> str:
-            root, ext = os.path.splitext(path)
-            return f"{root}{suffix}{ext}" if ext else f"{path}{suffix}"
-
-        if args.log_jsonl and suffix not in args.log_jsonl:
-            args.log_jsonl = _suffix_path(args.log_jsonl)
-        if args.summary_json and suffix not in args.summary_json:
-            args.summary_json = _suffix_path(args.summary_json)
-
-    resume_completed = 0
-    if args.resume_from_log and args.log_jsonl and os.path.exists(args.log_jsonl):
-        seen_samples: set[str] = set()
-        with open(args.log_jsonl, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                sid = obj.get("sample_id")
-                if sid and obj.get("answer_letter"):
-                    seen_samples.add(str(sid))
-        resume_completed = len(seen_samples)
-        if resume_completed > 0:
-            print(f"[resume] detected {resume_completed} completed samples in {args.log_jsonl}")
-    if resume_completed > 0:
-        samples = samples[resume_completed:]
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model, processor = _load_model_and_processor(args.model_path, args.dtype, device)
@@ -831,7 +797,12 @@ def main() -> None:
         "top_p": args.top_p,
         "max_new_tokens": args.max_new_tokens,
     }
-    run = maybe_init_wandb(args, run_config)
+    args._pnp_harness_mode = "lvbench_hf"
+    args._pnp_maybe_init_wandb = maybe_init_wandb
+    args._pnp_wandb_log = wandb_log
+    args._pnp_run_config = run_config
+    args._pnp_split = split
+    args._pnp_max_len = max_len
 
     rng = random.Random(1337 + int(args.shard_idx))
     stats = RunStats()
@@ -875,133 +846,18 @@ def main() -> None:
     cache_dir = Path(args.video_cache_dir) / args.dataset
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    processed = 0
-    for sample in samples:
-        processed += 1
-        processed_global = processed + resume_completed
-        video_path = dataset_adapter.video_path(sample)
-
-        if not os.path.exists(video_path) or os.path.getsize(video_path) <= 0:
-            stats.failed += 1
-            maybe_log_jsonl(
-                args.log_jsonl,
-                {
-                    "ts": time.time(),
-                    "dataset": sample.dataset,
-                    "split": split,
-                    "sample_id": sample.sample_id,
-                    "uid": sample.uid,
-                    "video_key": sample.video_key,
-                    "video_path": video_path,
-                    "error": "missing_video",
-                },
-            )
-            continue
-
-        try:
-            outcome = pnp_engine.run_sample(
-                sample,
-                dataset=dataset_adapter,
-                backend=backend,
-                cfg=cfg,
-                stats=stats,
-                rng=rng,
-                base_url="",
-                model_id=backend.get_model_id("", model_id=args.model_path),
-                run=run,
-            )
-        except Exception as e:
-            stats.failed += 1
-            maybe_log_jsonl(
-                args.log_jsonl,
-                {
-                    "ts": time.time(),
-                    "dataset": sample.dataset,
-                    "split": split,
-                    "sample_id": sample.sample_id,
-                    "uid": sample.uid,
-                    "video_key": sample.video_key,
-                    "video_path": video_path,
-                    "error": f"{type(e).__name__}: {str(e)[:400]}",
-                },
-            )
-            continue
-
-        if outcome.answer_letter is not None:
-            total_rounds += min(outcome.round_idx, int(args.max_rounds))
-            total_effective_rounds += outcome.effective_rounds
-            total_frames_used += int(outcome.answer_frame_count)
-            if dataset_adapter.is_correct(sample, outcome.answer_letter):
-                correct += 1
-        elif args.force_final_answer:
-            invalid_action_terminated += 1
-
-        failed = stats.failed
-        invalid_outputs = stats.invalid_outputs
-        total_model_calls = stats.total_model_calls
-        total_retries = stats.total_retries
-        think_present = dataset_adapter.think_present
-
-        if run is not None:
-            wandb_log(
-                run,
-                {
-                    "progress/processed": processed_global,
-                    "metrics/acc_so_far": correct / max(1, processed_global - failed),
-                    "metrics/failed": failed,
-                    "metrics/invalid_outputs": invalid_outputs,
-                    "metrics/avg_rounds": total_rounds / max(1, processed_global - failed),
-                    "metrics/avg_effective_rounds": total_effective_rounds / max(1, processed_global - failed),
-                    "metrics/avg_frames_used": total_frames_used / max(1, processed_global - failed),
-                },
-                step=processed_global,
-            )
-
-        if processed_global % 25 == 0 or processed_global == len(samples):
-            acc_so_far = correct / max(1, processed_global - failed)
-            print(
-                f"[{args.dataset}] processed {processed_global} / {len(samples)+resume_completed} | "
-                f"acc={acc_so_far:.4f} failed={failed} invalid={invalid_outputs} calls={total_model_calls}"
-            )
-
-    failed = stats.failed
-    invalid_outputs = stats.invalid_outputs
-    total_model_calls = stats.total_model_calls
-    total_retries = stats.total_retries
-    think_present = dataset_adapter.think_present
-
-    answered = max(0, len(samples) + resume_completed - failed)
-    summary = {
-        "dataset": args.dataset,
-        "split": split,
-        "model_path": args.model_path,
-        "num_samples": len(samples) + resume_completed,
-        "answered": answered,
-        "correct": correct,
-        "accuracy": correct / max(1, answered),
-        "failed": failed,
-        "invalid_outputs": invalid_outputs,
-        "invalid_action_terminated": invalid_action_terminated,
-        "avg_rounds": total_rounds / max(1, answered),
-        "avg_effective_rounds": total_effective_rounds / max(1, answered),
-        "avg_frames_used": total_frames_used / max(1, answered),
-        "think_present": think_present,
-        "total_model_calls": total_model_calls,
-        "total_retries": total_retries,
-        "max_len": max_len,
-        "config": run_config,
-        "ts": time.time(),
-    }
-
-    if args.summary_json:
-        os.makedirs(os.path.dirname(args.summary_json), exist_ok=True)
-        with open(args.summary_json, "w", encoding="utf-8") as f:
-            json.dump(summary, f, ensure_ascii=False, indent=2)
-
-    print(json.dumps(summary, indent=2))
-    if run is not None:
-        run.summary.update(summary)
-        run.finish()
+    pnp_harness.run_eval(
+        samples,
+        dataset=dataset_adapter,
+        backend=backend,
+        cfg=cfg,
+        stats=stats,
+        rng=rng,
+        base_url="",
+        model_id=backend.get_model_id("", model_id=args.model_path),
+        run=None,
+        args=args,
+    )
 
 
 if __name__ == "__main__":

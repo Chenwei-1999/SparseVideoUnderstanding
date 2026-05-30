@@ -44,7 +44,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from revise.pnp_prompts import SYSTEM_PROMPT_WITH_THINK as DEFAULT_SYSTEM_PROMPT_WITH_THINK
-from revise import pnp_engine
+from revise import pnp_harness
 from revise.pnp_protocols import LoopConfig, RunStats
 from revise.pnp_utils import FORCE_ANSWER_INSTRUCTIONS_SIMPLE as _FORCE_ANSWER_INSTRUCTIONS
 from revise.pnp_utils import chat_once as _shared_chat_once
@@ -876,61 +876,6 @@ def main() -> int:
     if args.max_samples > 0:
         samples = samples[: args.max_samples]
 
-    samples = shard_by_video(samples, args.num_shards, args.shard_idx)
-
-    # Stable order to improve download locality.
-    samples.sort(key=lambda s: (s.video_key, s.uid))
-
-    if not samples:
-        raise SystemExit("No samples selected (check --split/--max-samples/--sharding).")
-
-    # Auto-suffix output paths for multi-shard runs.
-    if args.num_shards > 1:
-        suffix = f".shard{args.shard_idx}of{args.num_shards}"
-
-        def _suffix_path(path: str) -> str:
-            root, ext = os.path.splitext(path)
-            return f"{root}{suffix}{ext}" if ext else f"{path}{suffix}"
-
-        if args.log_jsonl and suffix not in args.log_jsonl:
-            args.log_jsonl = _suffix_path(args.log_jsonl)
-        if args.summary_json and suffix not in args.summary_json:
-            args.summary_json = _suffix_path(args.summary_json)
-
-    resume_completed = 0
-    correct = 0
-    total_rounds = 0
-    invalid_outputs = 0
-    invalid_action_terminated = 0
-    failed = 0
-    total_model_calls = 0
-    total_retries = 0
-    total_effective_rounds = 0
-    think_present = 0
-    missing_summary = 0
-    answered = 0
-    total_frames_used_all = 0
-    total_frames_used_answered = 0
-
-    if args.resume_from_log and args.log_jsonl and os.path.exists(args.log_jsonl):
-        # Cheap resume heuristic: count answered samples in log.
-        seen_samples: set[str] = set()
-        with open(args.log_jsonl, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                sid = obj.get("sample_id")
-                if sid and "<answer>" in str(obj.get("raw_output", "")).lower():
-                    seen_samples.add(sid)
-        resume_completed = len(seen_samples)
-        if resume_completed > 0:
-            print(f"[resume] detected {resume_completed} completed samples in {args.log_jsonl}")
-
-    if resume_completed > 0:
-        samples = samples[resume_completed:]
-
     server_proc: Optional[subprocess.Popen[str]] = None
     if args.start_server:
         server_proc = _start_vllm_server(args)
@@ -968,11 +913,15 @@ def main() -> int:
         "log_jsonl": args.log_jsonl,
         "summary_json": args.summary_json,
     }
-    run = maybe_init_wandb(args, run_config)
+    args._pnp_harness_mode = "long_vllm"
+    args._pnp_maybe_init_wandb = maybe_init_wandb
+    args._pnp_wandb_log = wandb_log
+    args._pnp_run_config = run_config
+    args._pnp_split = split
+    args._pnp_video_path_for_error = lambda sample: Path(args.video_cache_dir) / sample.dataset / sample.video_key
 
     base_url = resolve_base_url(args.base_url, args.host, args.port)
     model_id = get_model_id(base_url, model_id=args.model_id)
-    system_prompt = DEFAULT_SYSTEM_PROMPT_WITH_THINK.format(max_frames_per_round=args.max_frames_per_round)
 
     rng = random.Random(42 + int(args.shard_idx))
     stats = RunStats()
@@ -1028,178 +977,25 @@ def main() -> int:
         restart_server=_restart_server if (args.restart_server_on_failure and args.start_server) else None
     )
 
-    start_t = time.time()
-
-    def _process_one(sample: MCVideoSample) -> None:
-        nonlocal correct, total_rounds, invalid_outputs, invalid_action_terminated, failed
-        nonlocal total_model_calls, total_retries, total_effective_rounds, think_present
-        nonlocal missing_summary, answered, total_frames_used_all, total_frames_used_answered
-
-        try:
-            outcome = pnp_engine.run_sample(
-                sample,
-                dataset=dataset_adapter,
-                backend=backend,
-                cfg=cfg,
-                stats=stats,
-                rng=rng,
-                base_url=base_url,
-                model_id=model_id,
-                run=run,
-            )
-        except Exception as e:
-            stats.failed += 1
-            maybe_log_jsonl(
-                args.log_jsonl,
-                {
-                    "ts": time.time(),
-                    "dataset": sample.dataset,
-                    "split": split,
-                    "sample_id": sample.sample_id,
-                    "uid": sample.uid,
-                    "video_key": sample.video_key,
-                    "video_url": sample.video_url,
-                    "video_path": str(Path(args.video_cache_dir) / sample.dataset / sample.video_key),
-                    "error": f"{type(e).__name__}: {str(e)[:400]}",
-                },
-            )
-        else:
-            if outcome.answer_letter is not None:
-                frames_used = len(outcome.seen_frames)
-                total_frames_used_all += frames_used
-                total_frames_used_answered += frames_used
-                answered += 1
-                total_rounds += min(outcome.round_idx, args.max_rounds)
-                total_effective_rounds += outcome.effective_rounds
-                if dataset_adapter.is_correct(sample, outcome.answer_letter):
-                    correct += 1
-            elif args.force_final_answer:
-                stats.invalid_action_terminated += 1
-                total_frames_used_all += len(outcome.seen_frames)
-
-        failed = stats.failed
-        invalid_outputs = stats.invalid_outputs
-        invalid_action_terminated = stats.invalid_action_terminated
-        total_model_calls = stats.total_model_calls
-        total_retries = stats.total_retries
-        think_present = dataset_adapter.think_present
-        missing_summary = dataset_adapter.missing_summary
-
-    processed = 0
-    for sample in samples:
-        _process_one(sample)
-        processed += 1
-        if processed % 20 == 0:
-            acc = correct / max(1, processed)
-            avg_rounds = total_rounds / max(1, processed)
-            avg_frames = total_frames_used_answered / max(1, answered)
-            print(
-                f"[{processed}/{len(samples)}] acc={acc:.4f} avg_rounds={avg_rounds:.3f} avg_frames={avg_frames:.2f} "
-                f"failed={failed} invalid_term={invalid_action_terminated} calls={total_model_calls} "
-                f"elapsed_s={time.time()-start_t:.1f}",
-                flush=True,
-            )
-            wandb_log(
-                run,
-                {
-                    "eval/acc": acc,
-                    "eval/avg_rounds": avg_rounds,
-                    "eval/avg_frames_used": avg_frames,
-                    "eval/failed": failed,
-                    "eval/invalid_action_terminated": invalid_action_terminated,
-                    "eval/invalid_outputs": invalid_outputs,
-                    "eval/total_calls": total_model_calls,
-                    "eval/think_present": think_present,
-                    "eval/missing_summary": missing_summary,
-                },
-                step=processed,
-            )
-
-    elapsed = time.time() - start_t
-    acc = correct / max(1, processed)
-    avg_rounds = total_rounds / max(1, processed)
-    avg_effective_rounds = total_effective_rounds / max(1, processed)
-    avg_frames_used = total_frames_used_answered / max(1, answered)
-    avg_frames_used_all = total_frames_used_all / max(1, processed)
-    prompt_log_lines = 0
-    prompt_log_bytes = 0
-    if args.log_jsonl and os.path.exists(args.log_jsonl):
-        prompt_log_bytes = os.path.getsize(args.log_jsonl)
-        with open(args.log_jsonl, "r", encoding="utf-8") as f:
-            prompt_log_lines = sum(1 for _ in f)
-
-    results = {
-        "samples": processed,
-        "answered": answered,
-        "correct": correct,
-        "accuracy": acc,
-        "avg_rounds": avg_rounds,
-        "avg_effective_rounds": avg_effective_rounds,
-        "avg_frames_used": avg_frames_used,
-        "avg_frames_used_all": avg_frames_used_all,
-        "failed": failed,
-        "elapsed_s": elapsed,
-        "prompt_log_lines": prompt_log_lines,
-        "prompt_log_bytes": prompt_log_bytes,
-        "invalid_outputs": invalid_outputs,
-        "invalid_action_terminated": invalid_action_terminated,
-        "total_retries": total_retries,
-        "total_model_calls": total_model_calls,
-        "think_present_rounds": think_present,
-        "missing_summary_rounds": missing_summary,
-    }
-    print(json.dumps(results, indent=2), flush=True)
-
-    wandb_info: Optional[dict[str, Any]] = None
-    if run is not None:
-        run.summary["answered"] = answered
-        run.summary["final_acc"] = acc
-        run.summary["final_avg_rounds"] = avg_rounds
-        run.summary["final_avg_effective_rounds"] = avg_effective_rounds
-        run.summary["final_avg_frames_used"] = avg_frames_used
-        run.summary["final_avg_frames_used_all"] = avg_frames_used_all
-        run.summary["failed"] = failed
-        run.summary["invalid_outputs"] = invalid_outputs
-        run.summary["invalid_action_terminated"] = invalid_action_terminated
-        run.summary["prompt_log_jsonl"] = args.log_jsonl
-        run.summary["prompt_log_lines"] = prompt_log_lines
-        run.summary["prompt_log_bytes"] = prompt_log_bytes
-        run.summary["think_present_rounds"] = think_present
-        run.summary["missing_summary_rounds"] = missing_summary
-        run.finish()
-        wandb_info = {
-            "enabled": True,
-            "mode": getattr(args, "wandb_mode", "") or os.getenv("WANDB_MODE"),
-            "project": args.wandb_project,
-            "entity": args.wandb_entity,
-            "name": args.wandb_name,
-            "group": args.wandb_group,
-            "id": getattr(run, "id", None),
-            "url": getattr(run, "url", None),
-            "run_dir": getattr(run, "dir", None),
-        }
-
-    if args.summary_json:
-        out_dir = os.path.dirname(args.summary_json)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        with open(args.summary_json, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    **run_config,
-                    "results": results,
-                    "prompt_log_jsonl": args.log_jsonl,
-                    "wandb": wandb_info,
-                    "command": " ".join(["python", *sys.argv]),
-                },
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
+    results = pnp_harness.run_eval(
+        samples,
+        dataset=dataset_adapter,
+        backend=backend,
+        cfg=cfg,
+        stats=stats,
+        rng=rng,
+        base_url=base_url,
+        model_id=model_id,
+        run=None,
+        args=args,
+    )
 
     if server_proc is not None and args.start_server:
         stop_server(server_proc)
-    if processed > 0 and (failed >= processed or total_model_calls == 0):
+    processed = int(results.get("samples", 0))
+    if processed > 0 and (
+        int(results.get("failed", 0)) >= processed or int(results.get("total_model_calls", 0)) == 0
+    ):
         return 2
     return 0
 

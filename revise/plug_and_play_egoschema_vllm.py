@@ -80,7 +80,7 @@ UNSTRUCTURED_SYSTEM_PROMPT = (
 )
 
 from revise.pnp_prompts import SYSTEM_PROMPT as DEFAULT_SYSTEM_PROMPT
-from revise import pnp_engine
+from revise import pnp_harness
 from revise.pnp_protocols import LoopConfig, RunStats
 from revise.pnp_utils import format_mc_question as _format_question
 from revise.pnp_utils import start_vllm_server as _shared_start_vllm_server
@@ -1042,18 +1042,11 @@ def main() -> int:
             allow_video_download=False,
             egoschema_video_repo=str(args.egoschema_video_repo),
         )
-    if args.num_shards > 1:
-        samples = [s for i, s in enumerate(samples) if (i % args.num_shards) == args.shard_idx]
     if not samples:
         raise RuntimeError("No samples loaded (check dataset source, JSON, video cache, or HF video availability).")
 
     if args.candidate_k <= 0:
         args.candidate_k = max(12, args.max_frames_per_round * 4)
-
-    os.makedirs("debug_runs", exist_ok=True)
-    log_jsonl = args.log_jsonl
-    if log_jsonl:
-        os.makedirs(os.path.dirname(log_jsonl) or ".", exist_ok=True)
 
     summary: dict[str, Any] = {
         "task": f"revise_plug_and_play_{str(args.dataset_name).strip().lower()}_vllm",
@@ -1094,8 +1087,6 @@ def main() -> int:
         else None,
     }
 
-    wandb_run = maybe_init_wandb(args, summary)
-
     server_proc: Optional[subprocess.Popen[str]] = None
     base_url = resolve_base_url(args.base_url, args.host, args.port)
     model_id: Optional[str] = None
@@ -1109,6 +1100,7 @@ def main() -> int:
             wait_for_server(args.host, args.port, timeout_s=args.server_timeout_s)
         if model_id is None:
             model_id = get_model_id(base_url, model_id=args.model_id)
+        return model_id
 
     def _restart_server() -> None:
         nonlocal server_proc, model_id
@@ -1121,23 +1113,15 @@ def main() -> int:
             wait_port(args.host, args.port, timeout_s=args.server_timeout_s)
             wait_for_server(args.host, args.port, timeout_s=args.server_timeout_s)
             model_id = get_model_id(base_url, model_id=args.model_id)
+        return model_id
 
-    # Resume logic
-    done_ids: set[str] = set()
-    if log_jsonl and args.resume_from_log and os.path.exists(log_jsonl):
-        with open(log_jsonl, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                sid = str(rec.get("sample_id") or "")
-                if sid and rec.get("done"):
-                    done_ids.add(sid)
-
-    # Eval loop
-    start_time = time.time()
-    legacy_total_rounds = 0
+    args._pnp_harness_mode = "egoschema"
+    args._pnp_maybe_init_wandb = maybe_init_wandb
+    args._pnp_wandb_log = wandb_log
+    args._pnp_summary_payload = summary
+    args._pnp_pre_sample = _ensure_server
+    args._pnp_restart_on_exception = _restart_server
+    args._pnp_restart_exception_type = requests.exceptions.RequestException
     stats = RunStats()
     ds = EgoSchemaDataset(
         dataset_name=dataset_name,
@@ -1170,189 +1154,29 @@ def main() -> int:
         caption_max_chars=0,
         captions_dir=None,
         hide_seen_frames_in_prompt=bool(args.hide_seen_frames_in_prompt),
-        log_jsonl=log_jsonl,
+        log_jsonl=args.log_jsonl,
         seed=int(args.seed),
         fallback_on_invalid_candidate_ids=False,
     )
 
-    for sample in samples:
-        if sample.sample_id in done_ids:
-            continue
-
-        stats.processed += 1
-        try:
-            _ensure_server()
-            assert model_id is not None
-            outcome = pnp_engine.run_sample(
-                sample,
-                dataset=ds,
-                backend=be,
-                cfg=cfg,
-                stats=stats,
-                rng=rng,
-                base_url=base_url,
-                model_id=model_id,
-                run=wandb_run,
-            )
-        except Exception as e:
-            stats.failed += 1
-            if log_jsonl:
-                with open(log_jsonl, "a", encoding="utf-8") as f:
-                    f.write(
-                        json.dumps(
-                            {
-                                "sample_id": sample.sample_id,
-                                "qid": sample.qid,
-                                "video_path": sample.video_path,
-                                "question": sample.question,
-                                "options": sample.choices,
-                                "task": sample.task,
-                                "evidence": sample.evidence,
-                                "dataset_name": dataset_name,
-                                "done": True,
-                                "error": f"{type(e).__name__}: {e}",
-                                "error_stage": "shared_engine",
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-            if (
-                args.restart_server_on_failure
-                and args.start_server
-                and not be.restart_on_request_exception
-                and isinstance(e, requests.exceptions.RequestException)
-            ):
-                _restart_server()
-            continue
-
-        if outcome.answer_letter is None:
-            if not outcome.terminated_invalid_action:
-                stats.failed += 1
-        else:
-            if ds.is_correct(sample, outcome.answer_letter):
-                stats.correct += 1
-            legacy_total_rounds += int(min(int(outcome.round_idx), int(args.max_rounds)))
-
-        if log_jsonl:
-            with open(log_jsonl, "a", encoding="utf-8") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "sample_id": sample.sample_id,
-                            "qid": sample.qid,
-                            "video_path": sample.video_path,
-                            "question": sample.question,
-                            "options": sample.choices,
-                            "answer_gt": chr(ord("A") + int(sample.answer_idx)),
-                            "task": sample.task,
-                            "evidence": sample.evidence,
-                            "dataset_name": dataset_name,
-                            "round": int(min(int(outcome.round_idx), int(args.max_rounds))),
-                            "done": True,
-                            "final_answer": outcome.answer_letter,
-                            "illegal_action": bool(outcome.terminated_invalid_action),
-                            "terminated_reason": outcome.terminated_reason,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-
-        total = stats.processed
-        failed = stats.failed
-        correct = stats.correct
-        invalid_outputs = stats.invalid_outputs
-        total_model_calls = stats.total_model_calls
-        if args.progress_interval > 0 and total % args.progress_interval == 0:
-            acc = correct / max(1, total - failed)
-            avg_r = legacy_total_rounds / max(1, total - failed)
-            msg = f"[progress] {total}/{len(samples)} done | acc={acc:.3f} avg_rounds={avg_r:.2f} failed={failed} invalid={invalid_outputs} calls={total_model_calls}"
-            print(msg, flush=True)
-            wandb_log(
-                wandb_run,
-                {
-                    "progress/samples": total,
-                    "progress/failed": failed,
-                    "metrics/accuracy": acc,
-                    "metrics/avg_rounds": avg_r,
-                    "debug/invalid_outputs": invalid_outputs,
-                    "debug/total_model_calls": total_model_calls,
-                },
-                step=total,
-            )
-
-    elapsed_s = time.time() - start_time
-    total = stats.processed
-    correct = stats.correct
-    failed = stats.failed
-    invalid_outputs = stats.invalid_outputs
-    total_retries = stats.total_retries
-    total_model_calls = stats.total_model_calls
-    fallback_frames_used = stats.fallback_frames_used
-    acc = correct / max(1, total - failed) if total > failed else 0.0
-    avg_rounds = legacy_total_rounds / max(1, total - failed) if total > failed else 0.0
-
-    results = {
-        "samples": total,
-        "accuracy": acc,
-        "avg_rounds": avg_rounds,
-        "failed": failed,
-        "elapsed_s": elapsed_s,
-        "invalid_outputs": invalid_outputs,
-        "total_retries": total_retries,
-        "total_model_calls": total_model_calls,
-        "fallback_frames_used": fallback_frames_used,
-    }
-    summary["results"] = results
-    summary["log_jsonl"] = log_jsonl
-
-    if log_jsonl and os.path.exists(log_jsonl):
-        try:
-            with open(log_jsonl, "r", encoding="utf-8") as f:
-                prompt_lines = sum(1 for _ in f)
-            prompt_bytes = os.path.getsize(log_jsonl)
-        except Exception:
-            prompt_lines = None
-            prompt_bytes = None
-        summary["prompt_log_lines"] = prompt_lines
-        summary["prompt_log_bytes"] = prompt_bytes
-
-    if wandb_run is not None:
-        summary["wandb"] = {
-            "enabled": True,
-            "mode": wandb_run.settings.mode,
-            "project": wandb_run.project,
-            "entity": getattr(wandb_run, "entity", None),
-            "name": wandb_run.name,
-            "group": getattr(wandb_run, "group", None),
-            "id": wandb_run.id,
-            "run_dir": wandb_run.dir,
-            "url": getattr(wandb_run, "url", None),
-        }
-        wandb_run.log(
-            {
-                "final/samples": total,
-                "final/failed": failed,
-                "final/accuracy": acc,
-                "final/avg_rounds": avg_rounds,
-                "final/invalid_outputs": invalid_outputs,
-                "final/total_model_calls": total_model_calls,
-                "final/fallback_frames_used": fallback_frames_used,
-            }
-        )
-        wandb_run.finish()
-
-    if args.summary_json:
-        os.makedirs(os.path.dirname(args.summary_json) or ".", exist_ok=True)
-        with open(args.summary_json, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, ensure_ascii=False)
+    results = pnp_harness.run_eval(
+        samples,
+        dataset=ds,
+        backend=be,
+        cfg=cfg,
+        stats=stats,
+        rng=rng,
+        base_url=base_url,
+        model_id=model_id or "",
+        run=None,
+        args=args,
+    )
 
     if server_proc is not None:
         stop_server(server_proc)
 
-    print(json.dumps({"results": results, "summary_json": args.summary_json, "log_jsonl": log_jsonl}, indent=2))
-    if total > 0 and (failed >= total or total_model_calls == 0):
+    total = int(results.get("samples", 0))
+    if total > 0 and (int(results.get("failed", 0)) >= total or int(results.get("total_model_calls", 0)) == 0):
         return 2
     return 0
 

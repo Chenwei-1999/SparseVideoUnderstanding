@@ -48,7 +48,7 @@ from revise.pnp_prompts import (
     SYSTEM_PROMPT_CAPTION_ONLY as DEFAULT_SYSTEM_PROMPT_CAPTION_ONLY,
 )
 from revise.pnp_utils import FORCE_ANSWER_INSTRUCTIONS_POHR as _FORCE_ANSWER_INSTRUCTIONS
-from revise import pnp_engine
+from revise import pnp_harness
 from revise.pnp_protocols import LoopConfig, RunStats
 from revise.pnp_utils import (
     ANSWER_RE,
@@ -1015,83 +1015,95 @@ def main() -> int:
         if not samples:
             raise RuntimeError("No samples loaded (check csv/map/video_root).")
 
-        num_shards = max(1, int(getattr(args, "num_shards", 1)))
-        shard_idx = int(getattr(args, "shard_idx", 0))
-        if num_shards > 1:
-            if not (0 <= shard_idx < num_shards):
-                raise ValueError(f"--shard-idx must be in [0, {num_shards}) (got {shard_idx}).")
-
-            def _suffix_path(path: str, *, suffix: str) -> str:
-                root, ext = os.path.splitext(path)
-                if ext:
-                    return f"{root}{suffix}{ext}"
-                return f"{path}{suffix}"
-
-            # Avoid multiple shards writing to the same output files by default.
-            shard_suffix = f".shard{shard_idx}of{num_shards}"
-            if args.log_jsonl and shard_suffix not in args.log_jsonl:
-                args.log_jsonl = _suffix_path(args.log_jsonl, suffix=shard_suffix)
-            if args.summary_json and shard_suffix not in args.summary_json:
-                args.summary_json = _suffix_path(args.summary_json, suffix=shard_suffix)
-
-            samples = [s for i, s in enumerate(samples) if (i % num_shards) == shard_idx]
-            if not samples:
-                raise RuntimeError(
-                    f"No samples selected for shard {shard_idx}/{num_shards} (check --max-samples / sharding)."
-                )
-
-        resume_completed = 0
-        correct = 0
-        total_rounds = 0
-        if args.resume_from_log and args.log_jsonl and os.path.exists(args.log_jsonl):
-            resume_completed, correct, total_rounds = _load_progress_from_log(
-                args.log_jsonl, max_rounds=args.max_rounds
-            )
-            resume_completed = min(resume_completed, len(samples))
-
-        processed = resume_completed
-        failed = 0
-        run = maybe_init_wandb(
-            args,
-            run_config={
-                "task": "revise_plug_and_play_nextqa_vllm",
-                "dataset_csv": args.csv,
-                "video_root": args.video_root,
-                "map_json": args.map_json,
-                "model_path": args.model_path,
-                "engine": "vllm",
-                "observation_mode": getattr(args, "observation_mode", "image"),
-                "tensor_parallel_size": args.tensor_parallel_size,
-                "dtype": args.dtype,
-                "max_model_len": args.max_model_len,
-                "gpu_memory_utilization": args.gpu_memory_utilization,
-                "max_samples": args.max_samples,
-                "num_shards": int(getattr(args, "num_shards", 1)),
-                "shard_idx": int(getattr(args, "shard_idx", 0)),
-                "max_rounds": args.max_rounds,
-                "max_frames_per_round": args.max_frames_per_round,
-                "max_retries_per_round": args.max_retries_per_round,
-                "temperature": args.temperature,
-                "top_p": args.top_p,
-                "max_tokens": args.max_tokens,
-                "use_candidate_frames": bool(args.use_candidate_frames),
-                "use_candidate_frame_ids": bool(args.use_candidate_frame_ids),
-                "require_candidate_frames": bool(getattr(args, "require_candidate_frames", False)),
-                "captions_dir": getattr(args, "captions_dir", None),
-                "caption_include": getattr(args, "caption_include", "none"),
-                "caption_max_chars": int(getattr(args, "caption_max_chars", 0)),
-                "strict_actions": bool(args.strict_actions),
-                "force_final_answer": args.force_final_answer,
-                "answer_only_final_round": bool(args.answer_only_final_round),
-                "resume_from_log": args.resume_from_log,
-                "initial_completed": resume_completed,
-                "log_jsonl": args.log_jsonl,
-            },
-        )
-        start_eval = time.time()
-        stats = RunStats(processed=resume_completed, correct=correct, total_rounds=total_rounds)
+        run_config = {
+            "task": "revise_plug_and_play_nextqa_vllm",
+            "dataset_csv": args.csv,
+            "video_root": args.video_root,
+            "map_json": args.map_json,
+            "model_path": args.model_path,
+            "engine": "vllm",
+            "observation_mode": getattr(args, "observation_mode", "image"),
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "dtype": args.dtype,
+            "max_model_len": args.max_model_len,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "max_samples": args.max_samples,
+            "num_shards": int(getattr(args, "num_shards", 1)),
+            "shard_idx": int(getattr(args, "shard_idx", 0)),
+            "max_rounds": args.max_rounds,
+            "max_frames_per_round": args.max_frames_per_round,
+            "max_retries_per_round": args.max_retries_per_round,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "max_tokens": args.max_tokens,
+            "use_candidate_frames": bool(args.use_candidate_frames),
+            "use_candidate_frame_ids": bool(args.use_candidate_frame_ids),
+            "require_candidate_frames": bool(getattr(args, "require_candidate_frames", False)),
+            "captions_dir": getattr(args, "captions_dir", None),
+            "caption_include": getattr(args, "caption_include", "none"),
+            "caption_max_chars": int(getattr(args, "caption_max_chars", 0)),
+            "strict_actions": bool(args.strict_actions),
+            "force_final_answer": args.force_final_answer,
+            "answer_only_final_round": bool(args.answer_only_final_round),
+            "resume_from_log": args.resume_from_log,
+            "log_jsonl": args.log_jsonl,
+        }
+        args._pnp_harness_mode = "nextqa"
+        args._pnp_maybe_init_wandb = maybe_init_wandb
+        args._pnp_wandb_log = wandb_log
+        args._pnp_load_progress_from_log = _load_progress_from_log
+        args._pnp_run_config = run_config
+        args._pnp_summary_payload = {
+            "task": "revise_plug_and_play_nextqa_vllm",
+            "dataset_csv": args.csv,
+            "video_root": args.video_root,
+            "map_json": args.map_json,
+            "model_path": args.model_path,
+            "engine": "vllm",
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "dtype": args.dtype,
+            "max_model_len": args.max_model_len,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "max_samples": args.max_samples,
+            "seed": int(getattr(args, "seed", 0)),
+            "num_shards": int(getattr(args, "num_shards", 1)),
+            "shard_idx": int(getattr(args, "shard_idx", 0)),
+            "max_rounds": args.max_rounds,
+            "max_frames_per_round": args.max_frames_per_round,
+            "max_retries_per_round": args.max_retries_per_round,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "max_tokens": args.max_tokens,
+            "use_candidate_frames": bool(args.use_candidate_frames),
+            "use_candidate_frame_ids": bool(args.use_candidate_frame_ids),
+            "require_candidate_frames": bool(getattr(args, "require_candidate_frames", False)),
+            "strict_actions": bool(args.strict_actions),
+            "fallback_on_invalid_candidate_ids": bool(args.fallback_on_invalid_candidate_ids),
+            "answer_only_final_round": bool(args.answer_only_final_round),
+        }
+        stats = RunStats()
         ds = NextQADataset()
         be = VllmHttpBackend()
+
+        def _restart_after_request_exception() -> str:
+            nonlocal server_proc
+            if (
+                args.start_server
+                and args.restart_server_on_failure
+                and server_proc is not None
+            ):
+                try:
+                    stop_server(server_proc)
+                except Exception:
+                    pass
+                server_proc = _start_vllm_server(args)
+                wait_port(args.host, args.port, timeout_s=args.server_timeout_s)
+                wait_for_server(args.host, args.port, timeout_s=args.server_timeout_s)
+                return be.get_model_id(base_url, model_id=args.model_id)
+            return model_id
+
+        args._pnp_restart_on_exception = _restart_after_request_exception
+        args._pnp_restart_exception_type = requests.exceptions.RequestException
         cfg = LoopConfig(
             max_rounds=args.max_rounds,
             max_frames_per_round=args.max_frames_per_round,
@@ -1116,227 +1128,18 @@ def main() -> int:
             seed=int(getattr(args, "seed", 0)),
             fallback_on_invalid_candidate_ids=bool(args.fallback_on_invalid_candidate_ids),
         )
-        processed = stats.processed
-        correct = stats.correct
-        total_rounds = stats.total_rounds
-        total_frames_used = stats.total_frames_used
-        effective_rounds_total = stats.effective_rounds_total
-        failed = stats.failed
-        invalid_outputs = stats.invalid_outputs
-        invalid_action_terminated = stats.invalid_action_terminated
-        total_retries = stats.total_retries
-        total_model_calls = stats.total_model_calls
-        fallback_frames_used = stats.fallback_frames_used
-        for sample in samples[resume_completed:]:
-            stats.processed += 1
-            try:
-                outcome = pnp_engine.run_sample(
-                    sample,
-                    dataset=ds,
-                    backend=be,
-                    cfg=cfg,
-                    stats=stats,
-                    rng=rng,
-                    base_url=base_url,
-                    model_id=model_id,
-                    run=run,
-                )
-
-                if outcome.answer_letter is not None and ds.is_correct(sample, outcome.answer_letter):
-                    stats.correct += 1
-                stats.total_frames_used += len(outcome.seen_frames)
-            except Exception as e:
-                stats.failed += 1
-                stats.total_rounds += args.max_rounds
-                if (
-                    args.start_server
-                    and args.restart_server_on_failure
-                    and server_proc is not None
-                    and isinstance(e, requests.exceptions.RequestException)
-                ):
-                    try:
-                        stop_server(server_proc)
-                    except Exception:
-                        pass
-                    server_proc = _start_vllm_server(args)
-                    wait_port(args.host, args.port, timeout_s=args.server_timeout_s)
-                    wait_for_server(args.host, args.port, timeout_s=args.server_timeout_s)
-                    model_id = be.get_model_id(base_url, model_id=args.model_id)
-
-            processed = stats.processed
-            correct = stats.correct
-            total_rounds = stats.total_rounds
-            total_frames_used = stats.total_frames_used
-            effective_rounds_total = stats.effective_rounds_total
-            failed = stats.failed
-            invalid_outputs = stats.invalid_outputs
-            invalid_action_terminated = stats.invalid_action_terminated
-            total_retries = stats.total_retries
-            total_model_calls = stats.total_model_calls
-            fallback_frames_used = stats.fallback_frames_used
-
-            if args.progress_interval > 0 and processed % args.progress_interval == 0:
-                elapsed = time.time() - start_eval
-                acc = correct / max(1, processed)
-                avg_rounds = total_rounds / max(1, processed)
-                calls_per_sample = total_model_calls / max(1, processed)
-                avg_frames_used = total_frames_used / max(1, processed)
-                print(
-                    f"[{processed}/{len(samples)}] acc={acc:.4f} avg_rounds={avg_rounds:.3f} "
-                    f"failed={failed} invalid={invalid_outputs} retries={total_retries} "
-                    f"calls={total_model_calls} calls/sample={calls_per_sample:.2f} elapsed_s={elapsed:.1f}",
-                    flush=True,
-                )
-                wandb_log(
-                    run,
-                    {
-                        "eval/acc": acc,
-                        "eval/avg_rounds": avg_rounds,
-                        "eval/avg_effective_rounds": effective_rounds_total / max(1, processed),
-                        "eval/avg_frames_used": avg_frames_used,
-                        "eval/failed": failed,
-                        "eval/processed": processed,
-                        "eval/elapsed_s": elapsed,
-                        "eval/invalid_outputs": invalid_outputs,
-                        "eval/invalid_action_terminated": invalid_action_terminated,
-                        "eval/total_retries": total_retries,
-                        "eval/total_model_calls": total_model_calls,
-                        "eval/fallback_frames_used": fallback_frames_used,
-                        "eval/calls_per_sample": calls_per_sample,
-                    },
-                    step=processed,
-                )
-
-        processed = stats.processed
-        correct = stats.correct
-        total_rounds = stats.total_rounds
-        total_frames_used = stats.total_frames_used
-        effective_rounds_total = stats.effective_rounds_total
-        failed = stats.failed
-        invalid_outputs = stats.invalid_outputs
-        invalid_action_terminated = stats.invalid_action_terminated
-        total_retries = stats.total_retries
-        total_model_calls = stats.total_model_calls
-        fallback_frames_used = stats.fallback_frames_used
-
-        acc = correct / max(1, processed)
-        avg_rounds = total_rounds / max(1, processed)
-        elapsed = time.time() - start_eval
-        prompt_log_lines = _count_file_lines(args.log_jsonl) if args.log_jsonl else 0
-        prompt_log_bytes = os.path.getsize(args.log_jsonl) if args.log_jsonl and os.path.exists(args.log_jsonl) else 0
-        avg_frames_used = total_frames_used / max(1, processed)
-        results = {
-            "samples": processed,
-            "correct": correct,
-            "accuracy": acc,
-            "total_rounds": total_rounds,
-            "avg_rounds": avg_rounds,
-            "total_frames_used": total_frames_used,
-            "avg_frames_used": avg_frames_used,
-            "total_effective_rounds": effective_rounds_total,
-            "avg_effective_rounds": effective_rounds_total / max(1, processed),
-            "failed": failed,
-            "elapsed_s": elapsed,
-            "prompt_log_lines": prompt_log_lines,
-            "prompt_log_bytes": prompt_log_bytes,
-            "invalid_outputs": invalid_outputs,
-            "invalid_action_terminated": invalid_action_terminated,
-            "total_retries": total_retries,
-            "total_model_calls": total_model_calls,
-            "fallback_frames_used": fallback_frames_used,
-        }
-        print(json.dumps(results, indent=2))
-        wandb_log(
-            run,
-            {
-                "eval/final_acc": acc,
-                "eval/final_avg_rounds": avg_rounds,
-                "eval/final_avg_effective_rounds": effective_rounds_total / max(1, processed),
-                "eval/final_avg_frames_used": avg_frames_used,
-                "eval/final_failed": failed,
-                "eval/final_elapsed_s": elapsed,
-                "eval/prompt_log_lines": prompt_log_lines,
-                "eval/prompt_log_bytes": prompt_log_bytes,
-                "eval/final_invalid_outputs": invalid_outputs,
-                "eval/final_invalid_action_terminated": invalid_action_terminated,
-                "eval/final_total_retries": total_retries,
-                "eval/final_total_model_calls": total_model_calls,
-                "eval/final_fallback_frames_used": fallback_frames_used,
-            },
-            step=processed,
+        pnp_harness.run_eval(
+            samples,
+            dataset=ds,
+            backend=be,
+            cfg=cfg,
+            stats=stats,
+            rng=rng,
+            base_url=base_url,
+            model_id=model_id,
+            run=None,
+            args=args,
         )
-        if run is not None:
-            run.summary["prompt_log_jsonl"] = args.log_jsonl
-            run.summary["prompt_log_lines"] = prompt_log_lines
-            run.summary["prompt_log_bytes"] = prompt_log_bytes
-            run.summary["final_acc"] = acc
-            run.summary["final_avg_rounds"] = avg_rounds
-            run.summary["final_avg_effective_rounds"] = effective_rounds_total / max(1, processed)
-            run.summary["final_avg_frames_used"] = avg_frames_used
-            run.summary["final_failed"] = failed
-            run.summary["invalid_outputs"] = invalid_outputs
-            run.summary["invalid_action_terminated"] = invalid_action_terminated
-            run.summary["total_retries"] = total_retries
-            run.summary["total_model_calls"] = total_model_calls
-            run.summary["fallback_frames_used"] = fallback_frames_used
-            run.finish()
-
-        if args.summary_json:
-            summary_dir = os.path.dirname(args.summary_json)
-            if summary_dir:
-                os.makedirs(summary_dir, exist_ok=True)
-            with open(args.summary_json, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "task": "revise_plug_and_play_nextqa_vllm",
-                        "dataset_csv": args.csv,
-                        "video_root": args.video_root,
-                        "map_json": args.map_json,
-                        "model_path": args.model_path,
-                        "engine": "vllm",
-                        "tensor_parallel_size": args.tensor_parallel_size,
-                        "dtype": args.dtype,
-                        "max_model_len": args.max_model_len,
-                        "gpu_memory_utilization": args.gpu_memory_utilization,
-                        "max_samples": args.max_samples,
-                        "seed": int(getattr(args, "seed", 0)),
-                        "num_shards": int(getattr(args, "num_shards", 1)),
-                        "shard_idx": int(getattr(args, "shard_idx", 0)),
-                        "max_rounds": args.max_rounds,
-                        "max_frames_per_round": args.max_frames_per_round,
-                        "max_retries_per_round": args.max_retries_per_round,
-                        "temperature": args.temperature,
-                        "top_p": args.top_p,
-                        "max_tokens": args.max_tokens,
-                        "use_candidate_frames": bool(args.use_candidate_frames),
-                        "use_candidate_frame_ids": bool(args.use_candidate_frame_ids),
-                        "require_candidate_frames": bool(getattr(args, "require_candidate_frames", False)),
-                        "strict_actions": bool(args.strict_actions),
-                        "fallback_on_invalid_candidate_ids": bool(args.fallback_on_invalid_candidate_ids),
-                        "answer_only_final_round": bool(args.answer_only_final_round),
-                        "results": results,
-                        "prompt_log_jsonl": args.log_jsonl,
-                        "prompt_log_lines": prompt_log_lines,
-                        "prompt_log_bytes": prompt_log_bytes,
-                        "wandb": {
-                            "enabled": bool(args.use_wandb),
-                            "mode": args.wandb_mode
-                            or os.getenv("WANDB_MODE")
-                            or ("online" if os.getenv("WANDB_API_KEY") else "offline"),
-                            "project": args.wandb_project,
-                            "entity": args.wandb_entity,
-                            "name": args.wandb_name,
-                            "group": args.wandb_group,
-                            "id": getattr(run, "id", None),
-                            "run_dir": getattr(run, "dir", None),
-                            "url": getattr(run, "url", None),
-                        },
-                        "command": "python " + " ".join(os.sys.argv),
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
         return 0
     finally:
         if server_proc is not None:
