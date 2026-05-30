@@ -1233,9 +1233,9 @@ def start_vllm_server(
     the four launchers share one definition. The two genuinely per-caller knobs
     (*image_limit*, *cuda_visible_default*) stay explicit at the call site.
     """
-    cmd, _env = build_vllm_serve_command(args, image_limit=image_limit, cuda_visible_default=cuda_visible_default)
+    cmd, env = build_vllm_serve_command(args, image_limit=image_limit, cuda_visible_default=cuda_visible_default)
     server_stdout, server_stderr = open_server_log_streams(getattr(args, "server_log", None))
-    # Note: matches the launchers' historical behavior of NOT passing env= to
-    # Popen. build_vllm_serve_command's env is consumed there (to resolve the
-    # vllm binary on PATH); the child inherits the parent environment.
-    return subprocess.Popen(cmd, stdout=server_stdout, stderr=server_stderr, text=True)
+    # Pass env= so the child vLLM process inherits the CUDA_VISIBLE_DEVICES /
+    # PATH that build_vllm_serve_command set up (all three original launchers
+    # did this; dropping it would break GPU selection and vllm-binary lookup).
+    return subprocess.Popen(cmd, env=env, stdout=server_stdout, stderr=server_stderr)

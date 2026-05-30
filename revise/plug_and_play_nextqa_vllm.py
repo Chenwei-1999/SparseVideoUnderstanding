@@ -47,6 +47,7 @@ from revise.pnp_prompts import (
     SYSTEM_PROMPT as DEFAULT_SYSTEM_PROMPT,
     SYSTEM_PROMPT_CAPTION_ONLY as DEFAULT_SYSTEM_PROMPT_CAPTION_ONLY,
 )
+from revise.pnp_utils import FORCE_ANSWER_INSTRUCTIONS_POHR as _FORCE_ANSWER_INSTRUCTIONS
 from revise.pnp_utils import (
     ANSWER_RE,
     SELECT_RE,
