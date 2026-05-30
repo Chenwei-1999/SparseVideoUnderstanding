@@ -48,6 +48,8 @@ from revise.pnp_prompts import (
     SYSTEM_PROMPT_CAPTION_ONLY as DEFAULT_SYSTEM_PROMPT_CAPTION_ONLY,
 )
 from revise.pnp_utils import FORCE_ANSWER_INSTRUCTIONS_POHR as _FORCE_ANSWER_INSTRUCTIONS
+from revise import pnp_engine
+from revise.pnp_protocols import LoopConfig, RunStats
 from revise.pnp_utils import (
     ANSWER_RE,
     SELECT_RE,
@@ -502,6 +504,48 @@ def _chat_once(
     return data["choices"][0]["message"]["content"]
 
 
+class NextQADataset:
+    def format_question(self, sample: NextQASample) -> str:
+        return _format_question(sample.question, sample.choices)
+
+    def system_prompt(self, cfg: LoopConfig) -> str:
+        prompt_template = (
+            DEFAULT_SYSTEM_PROMPT_CAPTION_ONLY
+            if getattr(cfg, "observation_mode", "image") == "caption"
+            else DEFAULT_SYSTEM_PROMPT
+        )
+        return prompt_template.format(max_frames_per_round=cfg.max_frames_per_round)
+
+    def build_user_text(self, **kwargs: Any) -> str:
+        return _build_user_text(**kwargs)
+
+    def extract_frames(self, sample: NextQASample, indices: list[int]) -> list[Image.Image]:
+        return extract_frames(sample.video_path, indices)
+
+    def sample_unseen_frames(self, frame_count: int, seen: set[int], k: int, rng: random.Random) -> list[int]:
+        return _sample_unseen_frames(frame_count, seen, k, rng=rng)
+
+    def retry_feedback_text(self, feedback: str, *, force_answer: bool = False) -> str:
+        return _retry_feedback_text(feedback, force_answer=force_answer)
+
+    def load_video_captions(self, captions_dir: str, video_id: str) -> dict[int, str]:
+        return _load_video_captions(captions_dir, video_id)
+
+    def get_video_fps(self, video_path: str) -> float:
+        return _get_video_fps(video_path)
+
+    def caption_key_for_frame_index(self, frame_idx: int, fps: float) -> int:
+        return _caption_key_for_frame_index(frame_idx, fps)
+
+
+class VllmHttpBackend:
+    def chat(self, **kwargs: Any) -> str:
+        return _chat_once(**kwargs)
+
+    def get_model_id(self, base_url: str, model_id: Optional[str] = None) -> str:
+        return get_model_id(base_url, model_id=model_id)
+
+
 def _start_vllm_server(args: argparse.Namespace) -> subprocess.Popen[str]:
     # NExTQA also samples caption-generation frames, so the per-prompt image cap
     # is the max of both frame budgets. The default GPU set is all four cards.
@@ -783,568 +827,67 @@ def main() -> int:
             },
         )
         start_eval = time.time()
-        invalid_outputs = 0
-        invalid_action_terminated = 0
-        total_model_calls = 0
-        total_retries = 0
-        fallback_frames_used = 0
-        effective_rounds_total = 0
-        total_frames_used = 0
+        stats = RunStats(processed=resume_completed, correct=correct, total_rounds=total_rounds)
+        ds = NextQADataset()
+        be = VllmHttpBackend()
+        cfg = LoopConfig(
+            max_rounds=args.max_rounds,
+            max_frames_per_round=args.max_frames_per_round,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_tokens=args.max_tokens,
+            request_timeout_s=args.request_timeout_s,
+            max_retries_per_round=args.max_retries_per_round,
+            strict_actions=bool(args.strict_actions),
+            force_final_answer=bool(args.force_final_answer),
+            use_candidate_frames=bool(args.use_candidate_frames),
+            candidate_k=args.candidate_k,
+            use_candidate_frame_ids=bool(args.use_candidate_frame_ids),
+            require_candidate_frames=bool(getattr(args, "require_candidate_frames", False)),
+            answer_only_final_round=bool(args.answer_only_final_round),
+            observation_mode=getattr(args, "observation_mode", "image"),
+            caption_include=getattr(args, "caption_include", "none"),
+            caption_max_chars=int(getattr(args, "caption_max_chars", 0)),
+            captions_dir=getattr(args, "captions_dir", None),
+            hide_seen_frames_in_prompt=bool(getattr(args, "hide_seen_frames_in_prompt", False)),
+            log_jsonl=args.log_jsonl,
+            seed=int(getattr(args, "seed", 0)),
+        )
+        setattr(cfg, "fallback_on_invalid_candidate_ids", bool(args.fallback_on_invalid_candidate_ids))
+        processed = stats.processed
+        correct = stats.correct
+        total_rounds = stats.total_rounds
+        total_frames_used = stats.total_frames_used
+        effective_rounds_total = stats.effective_rounds_total
+        failed = stats.failed
+        invalid_outputs = stats.invalid_outputs
+        invalid_action_terminated = stats.invalid_action_terminated
+        total_retries = stats.total_retries
+        total_model_calls = stats.total_model_calls
+        fallback_frames_used = stats.fallback_frames_used
         for sample in samples[resume_completed:]:
-            processed += 1
-            seen_frames: list[int] = []
+            stats.processed += 1
             try:
-                frame_count = sample.frame_count
-                if frame_count <= 0 and getattr(args, "observation_mode", "image") != "caption":
-                    try:
-                        import decord
-
-                        vr = decord.VideoReader(sample.video_path, ctx=decord.cpu(0))
-                        frame_count = int(len(vr))
-                    except Exception:
-                        frame_count = 0
-
-                question_block = _format_question(sample.question, sample.choices)
-                prompt_template = (
-                    DEFAULT_SYSTEM_PROMPT_CAPTION_ONLY
-                    if getattr(args, "observation_mode", "image") == "caption"
-                    else DEFAULT_SYSTEM_PROMPT
+                outcome = pnp_engine.run_sample(
+                    sample,
+                    dataset=ds,
+                    backend=be,
+                    cfg=cfg,
+                    stats=stats,
+                    rng=rng,
+                    base_url=base_url,
+                    model_id=model_id,
+                    run=run,
                 )
-                system_prompt = prompt_template.format(max_frames_per_round=args.max_frames_per_round)
 
-                video_captions: dict[int, str] = {}
-                if getattr(args, "captions_dir", None) and getattr(args, "caption_include", "none") != "none":
-                    video_captions = _load_video_captions(str(args.captions_dir), sample.video_id)
-
-                summary_state = (
-                    "P: I will summarize what has been shown so far; "
-                    "O: I will record the key observations from the current evidence; "
-                    "H: I will update my belief as new evidence arrives; "
-                    "U: some key detail may still be unclear; "
-                    "R: request more evidence if needed"
-                )
-                effective_rounds = 0
-                terminated_reason: Optional[str] = None
-                terminated_invalid_action = False
-
-                # Caption-only mode uses caption indices (1fps) as the action space length L.
-                observation_mode = getattr(args, "observation_mode", "image")
-                fps = 0.0
-                if observation_mode == "caption":
-                    if video_captions:
-                        frame_count = max(video_captions.keys(), default=-1) + 1
-                    if frame_count <= 0:
-                        # Fall back to a rough seconds estimate from video length, if available.
-                        try:
-                            import decord
-
-                            vr = decord.VideoReader(sample.video_path, ctx=decord.cpu(0))
-                            video_len = int(len(vr))
-                            fps = float(vr.get_avg_fps()) if hasattr(vr, "get_avg_fps") else 0.0
-                            if fps and fps > 0 and video_len > 0:
-                                frame_count = max(1, int(video_len / fps))
-                        except Exception:
-                            frame_count = max(1, int(sample.frame_count) if int(sample.frame_count) > 0 else 1)
-                elif video_captions:
-                    fps = _get_video_fps(sample.video_path)
-
-                def _caption_for_index(idx: int) -> str:
-                    if not video_captions:
-                        return "[no caption]"
-                    key = int(idx)
-                    if observation_mode != "caption":
-                        key = _caption_key_for_frame_index(int(idx), fps)
-                    return video_captions.get(int(key)) or "[no caption]"
-
-                init_frames = sample_uniform_indices(frame_count, args.max_frames_per_round)
-                next_frames = [int(i) for i in init_frames if i >= 0]
-                answer_letter: Optional[str] = None
-                last_user_text: Optional[str] = None
-                last_images: list[Image.Image] = []
-                last_frames: list[int] = []
-
-                for round_idx in range(1, args.max_rounds + 1):
-                    # Frames shown in this round.
-                    frames_this_round = [i for i in next_frames if i not in seen_frames]
-                    if not frames_this_round:
-                        frames_this_round = sample_uniform_indices(frame_count, 1)
-                    frames_this_round = frames_this_round[: args.max_frames_per_round]
-                    for i in frames_this_round:
-                        if i not in seen_frames:
-                            seen_frames.append(i)
-
-                    candidate_next_frames: list[int] = []
-                    if getattr(args, "use_candidate_frames", False):
-                        k = args.candidate_k if args.candidate_k is not None else max(12, args.max_frames_per_round * 4)
-                        candidate_next_frames = propose_candidate_frames(
-                            frame_count=frame_count,
-                            seen=set(seen_frames),
-                            k=k,
-                            rng=rng,
-                        )
-                    shown_captions: Optional[list[str]] = None
-                    candidate_captions: Optional[list[str]] = None
-                    shown_ts: Optional[list[int]] = None
-                    candidate_ts: Optional[list[int]] = None
-                    if video_captions:
-                        include = getattr(args, "caption_include", "none")
-                        max_chars = int(getattr(args, "caption_max_chars", 0))
-                        if include in ("shown", "both"):
-                            shown_captions = [
-                                truncate_text(_caption_for_index(int(i)), max_chars)
-                                for i in frames_this_round
-                            ]
-                            if observation_mode != "caption":
-                                shown_ts = [_caption_key_for_frame_index(int(i), fps) for i in frames_this_round]
-                        if include in ("candidate", "both") and candidate_next_frames:
-                            candidate_captions = [
-                                truncate_text(_caption_for_index(int(i)), max_chars)
-                                for i in candidate_next_frames
-                            ]
-                            if observation_mode != "caption":
-                                candidate_ts = [_caption_key_for_frame_index(int(i), fps) for i in candidate_next_frames]
-                    images: list[Image.Image] = []
-                    if observation_mode != "caption":
-                        images = extract_frames(sample.video_path, frames_this_round)
-                    user_text = _build_user_text(
-                        question_block=question_block,
-                        summary=summary_state,
-                        frame_count=frame_count,
-                        round_idx=round_idx,
-                        frame_indices=frames_this_round,
-                        seen_frames=seen_frames,
-                        render_images=(observation_mode != "caption"),
-                        hide_seen_frames=bool(getattr(args, "hide_seen_frames_in_prompt", False)),
-                        candidate_unseen_frames=candidate_next_frames if getattr(args, "use_candidate_frames", False) else None,
-                        use_candidate_frame_ids=bool(args.use_candidate_frame_ids),
-                        require_candidate_frames=bool(getattr(args, "require_candidate_frames", False)),
-                        shown_frame_captions=shown_captions,
-                        candidate_id_captions=candidate_captions,
-                        shown_frame_ts=shown_ts,
-                        candidate_id_ts=candidate_ts,
-                    )
-                    if args.force_final_answer and round_idx >= args.max_rounds:
-                        user_text = (
-                            f"{user_text}\n\n"
-                            "This is the final round. You MUST answer now using <think>...</think> then <answer>LETTER</answer>."
-                        )
-                    last_user_text = user_text
-                    last_images = images
-                    last_frames = frames_this_round
-
-                    raw = ""
-                    retry_feedback: Optional[str] = None
-                    attempt_user_text = user_text
-                    for retry_idx in range(max(0, int(args.max_retries_per_round)) + 1):
-                        raw = _chat_once(
-                            base_url=base_url,
-                            model_id=model_id,
-                            system_prompt=system_prompt,
-                            user_text=attempt_user_text,
-                            images=images,
-                            temperature=args.temperature,
-                            top_p=args.top_p,
-                            max_tokens=args.max_tokens,
-                            timeout_s=args.request_timeout_s,
-                        )
-                        total_model_calls += 1
-
-                        frames_tag = extract_tag(raw, SELECT_RE)
-                        requested_raw_frames: Optional[list[int]] = None
-                        requested_mapped_frames: Optional[list[int]] = None
-                        if frames_tag is not None:
-                            requested_raw_frames = dedupe_preserve_order(parse_int_list(frames_tag))
-                            if bool(args.use_candidate_frame_ids) and candidate_next_frames:
-                                mapped: list[int] = []
-                                invalid_id = False
-                                for cid in requested_raw_frames:
-                                    if 1 <= cid <= len(candidate_next_frames):
-                                        mapped.append(int(candidate_next_frames[cid - 1]))
-                                    else:
-                                        invalid_id = True
-                                requested_mapped_frames = None if invalid_id else dedupe_preserve_order(mapped)
-                            else:
-                                requested_mapped_frames = requested_raw_frames
-
-                        maybe_log_jsonl(
-                            args.log_jsonl,
-                            {
-                                "ts": time.time(),
-                                "sample_id": sample.sample_id,
-                                "qid": sample.qid,
-                                "video_id": sample.video_id,
-                                "video_path": sample.video_path,
-                                "round_idx": round_idx,
-                                "retry_idx": retry_idx,
-                                "retry_feedback": retry_feedback,
-                                "question": sample.question,
-                                "choices": sample.choices,
-                                "ground_truth_idx": sample.answer_idx,
-                                "observation_mode": observation_mode,
-                                "use_candidate_frames": bool(getattr(args, "use_candidate_frames", False)),
-                                "use_candidate_frame_ids": bool(args.use_candidate_frame_ids),
-                                "candidate_unseen_frames": candidate_next_frames if getattr(args, "use_candidate_frames", False) else None,
-                                "captions_dir": getattr(args, "captions_dir", None),
-                                "caption_include": getattr(args, "caption_include", "none"),
-                                "caption_max_chars": int(getattr(args, "caption_max_chars", 0)),
-                                "shown_frame_captions": shown_captions,
-                                "candidate_id_captions": candidate_captions,
-                                "seen_frames": seen_frames,
-                                "current_frames": frames_this_round,
-                                "requested_raw_frames": requested_raw_frames,
-                                "requested_mapped_frames": requested_mapped_frames,
-                                "summary_in": summary_state,
-                                "system_prompt": system_prompt,
-                                "user_text": attempt_user_text,
-                                "raw_output": raw,
-                            },
-                        )
-
-                        summary = extract_tag(raw, SUMMARIZE_RE)
-                        if (
-                            summary
-                            and (not is_placeholder(summary))
-                            and (not contains_banned_example(summary))
-                            and summary_has_ohrpu(summary)
-                            and (not _summary_has_stale_boilerplate(summary, seen_count=len(seen_frames)))
-                        ):
-                            summary_state = summary
-
-                        think = extract_tag(raw, THINK_RE)
-                        if think is None:
-                            invalid_outputs += 1
-                            terminated_reason = "missing_think"
-                            if retry_idx < int(args.max_retries_per_round):
-                                total_retries += 1
-                                retry_feedback = _retry_feedback_text(
-                                    "Invalid response: every response MUST begin with a <think>...</think> reasoning trace, "
-                                    "then either <summarize> + <select> (request) or <answer> (final).",
-                                    force_answer=bool(args.force_final_answer and round_idx >= args.max_rounds),
-                                )
-                                attempt_user_text = f"{user_text}\n\n{retry_feedback}"
-                                continue
-                            if args.strict_actions:
-                                invalid_action_terminated += 1
-                                terminated_invalid_action = True
-                                answer_letter = None
-                                break
-                            # Fall back to the usual next_frames heuristic.
-                            fallback_frames_used += 1
-                            requested = _sample_unseen_frames(
-                                frame_count, set(seen_frames), args.max_frames_per_round, rng=rng
-                            )
-                            next_frames = (
-                                requested[: args.max_frames_per_round]
-                                if requested
-                                else sample_uniform_indices(frame_count, 1)
-                            )
-                            break
-
-                        answer = extract_tag(raw, ANSWER_RE)
-                        if answer:
-                            answer_letter = normalize_answer_letter(answer, len(sample.choices))
-                            if answer_letter is None:
-                                invalid_outputs += 1
-                                terminated_reason = "invalid_answer_letter"
-                                if retry_idx < int(args.max_retries_per_round):
-                                    total_retries += 1
-                                    retry_feedback = _retry_feedback_text(
-                                        "Invalid response: <answer> must be exactly ONE option letter (A/B/C/D/E). "
-                                        "Do not output words or a sentence.",
-                                        force_answer=True,
-                                    )
-                                    attempt_user_text = f"{user_text}\n\n{retry_feedback}"
-                                    continue
-                                if args.strict_actions:
-                                    invalid_action_terminated += 1
-                                    terminated_invalid_action = True
-                                    answer_letter = None
-                                    break
-                                # Non-strict: ignore the invalid answer and continue with a fallback frame.
-                                fallback_frames_used += 1
-                                next_frames = _sample_unseen_frames(
-                                    frame_count, set(seen_frames), args.max_frames_per_round, rng=rng
-                                )
-                                if not next_frames:
-                                    next_frames = sample_uniform_indices(frame_count, 1)
-                                answer_letter = None
-                                break
-
-                            if bool(args.answer_only_final_round) and round_idx < args.max_rounds:
-                                invalid_outputs += 1
-                                terminated_reason = "early_answer_disallowed"
-                                if retry_idx < int(args.max_retries_per_round):
-                                    total_retries += 1
-                                    retry_feedback = _retry_feedback_text(
-                                        "Invalid response: do NOT answer yet. Request more frames using <summarize>...</summarize> and <select>...</select>.",
-                                        force_answer=False,
-                                    )
-                                    attempt_user_text = f"{user_text}\n\n{retry_feedback}"
-                                    answer_letter = None
-                                    continue
-                                if args.strict_actions:
-                                    invalid_action_terminated += 1
-                                    terminated_invalid_action = True
-                                    answer_letter = None
-                                    break
-                                # Non-strict: ignore the early answer and continue with a fallback frame request.
-                                fallback_frames_used += 1
-                                next_frames = _sample_unseen_frames(
-                                    frame_count, set(seen_frames), args.max_frames_per_round, rng=rng
-                                )
-                                if not next_frames:
-                                    next_frames = sample_uniform_indices(frame_count, 1)
-                                answer_letter = None
-                                break
-
-                            # Strict-paper Answer round: <think> + <answer> only. No <summarize>
-                            # is required here; the last committed summary is reused as the state
-                            # (captured above when a valid <summarize> was present on a Select round).
-                            break
-
-                        frames_text = extract_tag(raw, SELECT_RE)
-
-                        # If we didn't answer, we must request frames, with a valid summary.
-                        if frames_text is None:
-                            invalid_outputs += 1
-                            terminated_reason = "missing_frames_tag"
-                            if retry_idx < int(args.max_retries_per_round):
-                                total_retries += 1
-                                retry_feedback = _retry_feedback_text(
-                                    "Invalid response: missing <select> tag for requesting more frames. "
-                                    "Remember: <select> must list NEW frame indices to view NEXT (not already seen).",
-                                    force_answer=bool(args.force_final_answer and round_idx >= args.max_rounds),
-                                )
-                                attempt_user_text = f"{user_text}\n\n{retry_feedback}"
-                                continue
-                            if args.strict_actions:
-                                invalid_action_terminated += 1
-                                terminated_invalid_action = True
-                                answer_letter = None
-                                break
-                            next_frames = sample_uniform_indices(frame_count, 1)
-                            break
-
-                        if summary is None or is_placeholder(summary) or contains_banned_example(summary) or (not summary_has_ohrpu(summary)):
-                            invalid_outputs += 1
-                            terminated_reason = "invalid_select_summary"
-                            if retry_idx < int(args.max_retries_per_round):
-                                total_retries += 1
-                                retry_feedback = _retry_feedback_text(
-                                    "Invalid response: include a meaningful <summarize> with P/O/H/U/R in that exact order "
-                                    "(no placeholders like '.../none/unknown').",
-                                    force_answer=bool(args.force_final_answer and round_idx >= args.max_rounds),
-                                )
-                                attempt_user_text = f"{user_text}\n\n{retry_feedback}"
-                                continue
-                        if summary is not None and _summary_has_stale_boilerplate(summary, seen_count=len(seen_frames)):
-                            invalid_outputs += 1
-                            terminated_reason = "stale_select_summary"
-                            if retry_idx < int(args.max_retries_per_round):
-                                total_retries += 1
-                                retry_feedback = _retry_feedback_text(
-                                    "Invalid response: the <summarize> claims no frames/captions were seen, but evidence was shown. "
-                                    "Rewrite <summarize> to reflect what was observed so far (P/O/H/U/R), then request frames.",
-                                    force_answer=bool(args.force_final_answer and round_idx >= args.max_rounds),
-                                )
-                                attempt_user_text = f"{user_text}\n\n{retry_feedback}"
-                                continue
-
-                        if (not bool(args.use_candidate_frame_ids)) and _frames_has_range_syntax(frames_text):
-                            invalid_outputs += 1
-                            terminated_reason = "frames_range_syntax"
-                            if retry_idx < int(args.max_retries_per_round):
-                                total_retries += 1
-                                retry_feedback = _retry_feedback_text(
-                                    "Invalid response: <select> must be a comma-separated list of integers only "
-                                    "(NO ranges like '4-182', no hyphens). Choose up to {k} NEW frames.".format(
-                                        k=args.max_frames_per_round
-                                    ),
-                                    force_answer=bool(args.force_final_answer and round_idx >= args.max_rounds),
-                                )
-                                attempt_user_text = f"{user_text}\n\n{retry_feedback}"
-                                continue
-
-                        requested = dedupe_preserve_order(parse_int_list(frames_text))
-                        if bool(args.use_candidate_frame_ids) and candidate_next_frames:
-                            mapped: list[int] = []
-                            invalid_id = False
-                            for cid in requested:
-                                if 1 <= cid <= len(candidate_next_frames):
-                                    mapped.append(int(candidate_next_frames[cid - 1]))
-                                else:
-                                    invalid_id = True
-                            if invalid_id:
-                                invalid_outputs += 1
-                                terminated_reason = "frames_out_of_range"
-                                if retry_idx < int(args.max_retries_per_round):
-                                    total_retries += 1
-                                    retry_feedback = _retry_feedback_text(
-                                        "Invalid response: when Candidate Frame IDs are provided, <select> must contain only "
-                                        "IDs in the allowed range [1..K] (comma-separated integers).",
-                                        force_answer=bool(args.force_final_answer and round_idx >= args.max_rounds),
-                                    )
-                                    attempt_user_text = f"{user_text}\n\n{retry_feedback}"
-                                    continue
-                                if args.strict_actions and not bool(args.fallback_on_invalid_candidate_ids):
-                                    invalid_action_terminated += 1
-                                    terminated_invalid_action = True
-                                    answer_letter = None
-                                    break
-                                # Be forgiving: fall back to heuristic sampling instead of hard-terminating.
-                                fallback_frames_used += 1
-                                requested = candidate_next_frames[: args.max_frames_per_round]
-                                if not requested:
-                                    requested = _sample_unseen_frames(
-                                        frame_count, set(seen_frames), args.max_frames_per_round, rng=rng
-                                    )
-                                next_frames = (
-                                    requested[: args.max_frames_per_round]
-                                    if requested
-                                    else sample_uniform_indices(frame_count, 1)
-                                )
-                                break
-                            else:
-                                requested = dedupe_preserve_order(mapped)
-                                requested = [i for i in requested if 0 <= i < frame_count and i not in seen_frames]
-                        else:
-                            if bool(getattr(args, "require_candidate_frames", False)) and candidate_next_frames:
-                                allowed = {int(i) for i in candidate_next_frames}
-                                disallowed = [i for i in requested if int(i) not in allowed]
-                                if disallowed:
-                                    invalid_outputs += 1
-                                    terminated_reason = "frames_not_in_candidates"
-                                    if retry_idx < int(args.max_retries_per_round):
-                                        total_retries += 1
-                                        retry_feedback = _retry_feedback_text(
-                                            "Invalid response: requested frames must be chosen ONLY from the candidate unseen frame list/ranges provided.",
-                                            force_answer=bool(args.force_final_answer and round_idx >= args.max_rounds),
-                                        )
-                                        attempt_user_text = f"{user_text}\n\n{retry_feedback}"
-                                        continue
-                                    if args.strict_actions:
-                                        invalid_action_terminated += 1
-                                        terminated_invalid_action = True
-                                        answer_letter = None
-                                        break
-                                    requested = []
-                                else:
-                                    requested = [i for i in requested if 0 <= i < frame_count and i not in seen_frames and int(i) in allowed]
-                            else:
-                                allowed_ranges = unseen_intervals(frame_count, seen_frames)
-                                requested = [
-                                    i
-                                    for i in requested
-                                    if 0 <= i < frame_count and i not in seen_frames and in_intervals(i, allowed_ranges)
-                                ]
-
-                        if requested and len(requested) > int(args.max_frames_per_round):
-                            invalid_outputs += 1
-                            terminated_reason = "too_many_frames"
-                            requested = requested[: int(args.max_frames_per_round)]
-                        if not requested:
-                            invalid_outputs += 1
-                            terminated_reason = "invalid_frames"
-                            if retry_idx < int(args.max_retries_per_round):
-                                total_retries += 1
-                                candidate_text = (
-                                    " Allowed unseen ranges: "
-                                    f"{format_intervals(unseen_intervals(frame_count, seen_frames))}."
-                                )
-                                retry_feedback = _retry_feedback_text(
-                                    "Invalid response: requested frames must be NEW and within range. "
-                                    "In <select>, output 1–{k} comma-separated integers NOT in Seen frames.".format(
-                                        k=args.max_frames_per_round
-                                    )
-                                    + candidate_text,
-                                    force_answer=bool(args.force_final_answer and round_idx >= args.max_rounds),
-                                )
-                                attempt_user_text = f"{user_text}\n\n{retry_feedback}"
-                                continue
-                            if args.strict_actions:
-                                invalid_action_terminated += 1
-                                terminated_invalid_action = True
-                                answer_letter = None
-                                break
-
-                            # Fall back to heuristic sampling.
-                            fallback_frames_used += 1
-                            requested = candidate_next_frames[: args.max_frames_per_round]
-                            if not requested:
-                                requested = _sample_unseen_frames(
-                                    frame_count, set(seen_frames), args.max_frames_per_round, rng=rng
-                                )
-                            next_frames = (
-                                requested[: args.max_frames_per_round] if requested else sample_uniform_indices(frame_count, 1)
-                            )
-                            break
-
-                        next_frames = requested[: args.max_frames_per_round]
-                        effective_rounds += 1
-                        effective_rounds_total += 1
-                        break
-
-                    if answer_letter is not None:
-                        break
-                    if args.strict_actions and terminated_invalid_action:
-                        break
-
-                total_rounds += round_idx
-                if (
-                    args.force_final_answer
-                    and answer_letter is None
-                    and last_user_text is not None
-                    and not (args.strict_actions and terminated_invalid_action)
-                ):
-                    forced_user_text = (
-                        f"{last_user_text}\n\n"
-                        "Max rounds reached. Provide the final answer now using <think>...</think> then <answer>LETTER</answer>."
-                    )
-                    raw = _chat_once(
-                        base_url=base_url,
-                        model_id=model_id,
-                        system_prompt=system_prompt,
-                        user_text=forced_user_text,
-                        images=last_images,
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        max_tokens=args.max_tokens,
-                        timeout_s=args.request_timeout_s,
-                    )
-                    total_model_calls += 1
-                    maybe_log_jsonl(
-                        args.log_jsonl,
-                        {
-                            "ts": time.time(),
-                            "sample_id": sample.sample_id,
-                            "qid": sample.qid,
-                            "video_id": sample.video_id,
-                            "video_path": sample.video_path,
-                            "round_idx": args.max_rounds + 1,
-                            "forced_answer": True,
-                            "question": sample.question,
-                            "choices": sample.choices,
-                        "ground_truth_idx": sample.answer_idx,
-                        "seen_frames": seen_frames,
-                        "current_frames": last_frames,
-                        "summary_in": summary_state,
-                        "system_prompt": system_prompt,
-                        "user_text": forced_user_text,
-                        "raw_output": raw,
-                    },
-                )
-                answer = extract_tag(raw, ANSWER_RE)
-                if answer:
-                    answer_letter = normalize_answer_letter(answer, len(sample.choices))
-
-                if answer_letter is not None:
-                    pred_idx = ord(answer_letter) - ord("A")
+                if outcome.answer_letter is not None:
+                    pred_idx = ord(outcome.answer_letter) - ord("A")
                     if pred_idx == sample.answer_idx:
-                        correct += 1
-                total_frames_used += len(seen_frames)
+                        stats.correct += 1
+                stats.total_frames_used += len(outcome.seen_frames)
             except Exception as e:
-                failed += 1
-                total_rounds += args.max_rounds
+                stats.failed += 1
+                stats.total_rounds += args.max_rounds
                 if (
                     args.start_server
                     and args.restart_server_on_failure
@@ -1358,7 +901,19 @@ def main() -> int:
                     server_proc = _start_vllm_server(args)
                     wait_port(args.host, args.port, timeout_s=args.server_timeout_s)
                     wait_for_server(args.host, args.port, timeout_s=args.server_timeout_s)
-                    model_id = get_model_id(base_url, model_id=args.model_id)
+                    model_id = be.get_model_id(base_url, model_id=args.model_id)
+
+            processed = stats.processed
+            correct = stats.correct
+            total_rounds = stats.total_rounds
+            total_frames_used = stats.total_frames_used
+            effective_rounds_total = stats.effective_rounds_total
+            failed = stats.failed
+            invalid_outputs = stats.invalid_outputs
+            invalid_action_terminated = stats.invalid_action_terminated
+            total_retries = stats.total_retries
+            total_model_calls = stats.total_model_calls
+            fallback_frames_used = stats.fallback_frames_used
 
             if args.progress_interval > 0 and processed % args.progress_interval == 0:
                 elapsed = time.time() - start_eval
@@ -1391,6 +946,18 @@ def main() -> int:
                     },
                     step=processed,
                 )
+
+        processed = stats.processed
+        correct = stats.correct
+        total_rounds = stats.total_rounds
+        total_frames_used = stats.total_frames_used
+        effective_rounds_total = stats.effective_rounds_total
+        failed = stats.failed
+        invalid_outputs = stats.invalid_outputs
+        invalid_action_terminated = stats.invalid_action_terminated
+        total_retries = stats.total_retries
+        total_model_calls = stats.total_model_calls
+        fallback_frames_used = stats.fallback_frames_used
 
         acc = correct / max(1, processed)
         avg_rounds = total_rounds / max(1, processed)
