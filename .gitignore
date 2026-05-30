@@ -2,8 +2,15 @@
 /paper/
 /paper_backup*/
 /overleaf/
+/overleaf_arXiv/
 /arxiv/
 /camera_ready/
+# Project webpage (deployed from a separate clone), agent guidelines, and
+# local experiment scratch are not part of the open-source code release.
+/web/
+/AGENTS.md
+/examples/
+/docs/
 /698ffd6344971305209c4e53/
 /presentations/
 /experiments/
