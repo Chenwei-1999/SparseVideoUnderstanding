@@ -1,0 +1,130 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+custom_reward_function:
+  path: pkg://verl.utils.reward_score.eager_videoqa_paper
+  name: compute_score
+  reward_kwargs:
+    # r_t = λ1 r_conf + λ2 r_sum + λ3 r_stop + r_format
+    lambda_conf: 1.0
+    lambda_sum: 0.0
+    lambda_stop: 0.5
+    gamma: 0.99
+    format_reward: 0.05
+    # Early stopping reward design: β, τ
+    stop_bonus_beta: 1.0
+    stop_round_threshold: 2
+
+data:
+  trust_remote_code: True
+  custom_cls:
+    path: pkg://verl.utils.dataset.lvbench_dataset
+    name: LVBenchDataset
+  lvbench:
+    # Must contain a `lvbench/` folder with extracted mp4s.
+    video_cache_dir: ${oc.env:REVISE_VIDEO_CACHE_DIR,${hydra:runtime.cwd}/data/revise_assets/video_cache}
+    # LVBench HF dataset currently exposes a single split named "train".
+    split: train
+  train_files: train
+  val_files: train
+  max_prompt_length: 8192
+  # Multi-turn REVISE trajectories include user turns + vision tokens; keep a large padding budget.
+  max_response_length: 4096
+  train_batch_size: 1
+  return_raw_chat: True
+  return_multi_modal_inputs: False
+
+actor_rollout_ref:
+  model:
+    path: lmms-lab/LLaVA-OneVision-1.5-4B-Instruct
+    trust_remote_code: True
+    override_config:
+      # Avoid hard dependency on flash-attn (often ABI-mismatched on shared clusters).
+      attn_implementation: sdpa
+  ref:
+    fsdp_config:
+      model_dtype: bfloat16
+  actor:
+    fsdp_config:
+      model_dtype: bfloat16
+    optim:
+      lr: 1e-6
+    ppo_mini_batch_size: 128
+    use_dynamic_bsz: True
+    use_kl_loss: True
+    kl_loss_coef: 0.001
+    entropy_coeff: 0
+    checkpoint:
+      save_contents: ["hf_model"]
+      load_contents: []
+  rollout:
+    # Use the Transformers-based rollout backend (no vLLM/SGLang required).
+    name: hf
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    # Generation length per assistant turn (keep small even if response_length is large).
+    max_new_tokens: 128
+    temperature: 0.2
+    top_p: 0.9
+    do_sample: True
+    n: 4
+    dtype: bfloat16
+    gpu_memory_utilization: 0.6
+    enable_chunked_prefill: False
+    enable_prefix_caching: False
+    load_format: auto
+    # LVBench prompts are longer; keep headroom.
+    max_model_len: 32768
+    max_num_batched_tokens: 32768
+    data_parallel_size: 1
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    # Agent loop accumulates images across rounds; keep a small cap so prompts remain lightweight.
+    limit_images: 7
+    agent:
+      default_agent_loop: revise_agent
+      rollout_mode: hybrid
+    revise:
+      # Evaluation-style hyperparams (fast-ish, but allows multi-turn).
+      max_rounds: 6
+      max_frames_per_round: 7
+      max_vision_inputs: 7
+      max_retries_per_round: 1
+      initial_sampling: uniform
+      include_timestamps: True
+      # Use 1fps timeline indices (seconds) for frame actions, mapping to real video frames internally.
+      use_1fps_timeline: True
+      # EAGER: need summary-only scoring; we keep margins on to produce it.
+      compute_margins: True
+      margin_logprobs_k: 64
+      margin_temperature: 1.0
+      summary_only_logprobs_k: 64
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: False
+
+trainer:
+  project_name: revise_lvbench
+  experiment_name: llava-onevision-1.5-4b-lvbench-grpo-eager-l1-s0-stop0p5-b1-t2-100
+  total_epochs: 1
+  total_training_steps: 100
+  n_gpus_per_node: 4
+  resume_mode: disable
+  val_before_train: False
+  # Validate once at the end (LVBench HF currently provides only a single split).
+  test_freq: 100
+  save_freq: 100
+  max_actor_ckpt_to_keep: 1
+  logger: ["console", "wandb"]
+  # Use an absolute path so Ray workers don't need Hydra interpolations like ${hydra:runtime.cwd}.
+  default_local_dir: ${hydra:runtime.cwd}/outputs/2026-01-27/revise_lvbench_grpo_eager_l1_s0_stop0p5_beta1_tau2_100
+
+ray_kwargs:
+  ray_init:
+    num_cpus: 32
