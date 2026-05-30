@@ -1,4 +1,4 @@
-from scripts.repro.prepare_egoschema_subset import canonicalize_egoschema_row
+from scripts.prepare_egoschema_subset import canonicalize_egoschema_row
 
 
 def test_canonicalize_egoschema_subset_row_maps_hf_fields():

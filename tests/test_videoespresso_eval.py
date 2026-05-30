@@ -4,20 +4,20 @@ import zipfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import examples.revise.plug_and_play_nextqa_vllm as nextqa_vllm
-import examples.revise.plug_and_play_egoschema_vllm as egoschema_vllm
-import examples.revise.pnp_utils as pnp_utils
-from examples.revise.plug_and_play_egoschema_vllm import _load_egoschema_samples
-import examples.revise.plug_and_play_lvbench_hf as lvbench_hf
-from examples.revise.plug_and_play_nextqa_vllm import _load_nextqa_samples
-from examples.revise.plug_and_play_videomme_lvbench_vllm import _bare_answer_after_summary
-from examples.revise.pnp_utils import (
+import revise.plug_and_play_nextqa_vllm as nextqa_vllm
+import revise.plug_and_play_egoschema_vllm as egoschema_vllm
+import revise.pnp_utils as pnp_utils
+from revise.plug_and_play_egoschema_vllm import _load_egoschema_samples
+import revise.plug_and_play_lvbench_hf as lvbench_hf
+from revise.plug_and_play_nextqa_vllm import _load_nextqa_samples
+from revise.plug_and_play_videomme_lvbench_vllm import _bare_answer_after_summary
+from revise.pnp_utils import (
     apply_processor_chat_template,
     configure_llava_processor,
     format_videoespresso_question_block,
     format_videomme_question_block,
 )
-from scripts.repro.extract_videoespresso_split_zip_subset import (
+from scripts.extract_videoespresso_split_zip_subset import (
     DEFAULT_PREFIX,
     _extract_entry,
     _part_paths,

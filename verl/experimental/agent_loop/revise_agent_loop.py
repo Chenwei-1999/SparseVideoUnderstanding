@@ -17,8 +17,8 @@ from uuid import uuid4
 import numpy as np
 from PIL import Image
 
-from examples.revise.pnp_prompts import SYSTEM_PROMPT
-from examples.revise.pnp_utils import (
+from revise.pnp_prompts import SYSTEM_PROMPT
+from revise.pnp_utils import (
     ANSWER_RE,
     SELECT_RE,
     SUMMARIZE_RE,

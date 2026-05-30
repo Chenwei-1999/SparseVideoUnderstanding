@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from scripts.repro.paper_suite import EXPERIMENTS, _cmd_egoschema_pnp, _egoschema_local_coverage
+from scripts.paper_suite import EXPERIMENTS, _cmd_egoschema_pnp, _egoschema_local_coverage
 
 
 def test_egoschema_local_coverage_counts_present_videos(tmp_path):
@@ -113,11 +113,11 @@ def test_smoke_sft_training_pipelines_keep_tiny_teacher_cap(tmp_path):
 
 def test_sft_teacher_scripts_use_neutral_teacher_defaults():
     repo_root = Path(__file__).resolve().parents[1]
-    nextqa_script = (repo_root / "examples/revise/run_generate_teacher_data.sh").read_text(encoding="utf-8")
-    videoespresso_script = (repo_root / "examples/revise/run_generate_teacher_data_videoespresso.sh").read_text(
+    nextqa_script = (repo_root / "revise/run_generate_teacher_data.sh").read_text(encoding="utf-8")
+    videoespresso_script = (repo_root / "revise/run_generate_teacher_data_videoespresso.sh").read_text(
         encoding="utf-8"
     )
-    sft_converter = (repo_root / "examples/revise/generate_sft_data.py").read_text(encoding="utf-8")
+    sft_converter = (repo_root / "revise/generate_sft_data.py").read_text(encoding="utf-8")
 
     assert 'MAX_SAMPLES="${MAX_SAMPLES:-8000}"' in nextqa_script
     assert 'MAX_SAMPLES="${MAX_SAMPLES:-8000}"' in videoespresso_script
@@ -198,7 +198,7 @@ def test_component_ablation_experiments_toggle_carryover_and_structured_flags(tm
 def test_phase_a_teacher_log_override_replaces_inline_gen_for_nextqa(tmp_path, monkeypatch):
     # Without override: training pipeline emits the inline teacher-generation shell.
     monkeypatch.delenv("REVISE_NEXTQA_TEACHER_LOG_OVERRIDE", raising=False)
-    from scripts.repro.common import discover_assets
+    from scripts.common import discover_assets
     assets = discover_assets()
     if not assets["datasets"]["nextqa"].get("video_root"):
         # Cluster-shaped check fixture not available locally; skip silently.
@@ -223,7 +223,7 @@ def test_phase_a_teacher_log_override_preserves_videoespresso_prep_and_extract(t
     # VE pipeline = prepare_mc + extract_videos + teacher_gen + sft_then_rl.
     # Override only replaces teacher_gen; prepare + extract are needed for GRPO.
     monkeypatch.delenv("REVISE_VIDEOESPRESSO_TEACHER_LOG_OVERRIDE", raising=False)
-    from scripts.repro.common import discover_assets
+    from scripts.common import discover_assets
     assets = discover_assets()
     if not assets["datasets"]["videoespresso"].get("train_video_json"):
         return

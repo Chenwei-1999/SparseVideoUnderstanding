@@ -45,7 +45,7 @@ The agent starts with 3 uniformly sampled frames, updates its POHR summary, iden
 
 The numbers below are the originally reported paper numbers. They are kept for traceability while
 the full reproduction suite is rerun with the corrected evaluation pipelines. Do not treat them as
-newly verified results until `docs/REPRODUCE.md` has a completed run manifest and the paper tables
+newly verified results until the full reproduction suite has completed and the paper tables
 are refreshed from those outputs.
 
 | Benchmark | Model | Accuracy | Avg Frames |
@@ -92,43 +92,41 @@ pip install -e ".[gpu]"
 Paper-level reproduction entrypoints:
 
 ```bash
-ENV_NAME=verlrun INSTALL_BACKENDS=vllm bash scripts/repro/setup_env.sh
-python scripts/repro/doctor.py
-python scripts/repro/paper_suite.py list
+ENV_NAME=verlrun INSTALL_BACKENDS=vllm bash scripts/setup_env.sh
+python scripts/doctor.py
+python scripts/paper_suite.py list
 ```
-
-See [docs/REPRODUCE.md](docs/REPRODUCE.md) for the full experiment matrix, environment variables, and known blockers.
 
 Current reproduction behavior:
 
 - NExT-QA caption baselines auto-generate missing caption caches when `REVISE_NEXTQA_CAPTIONS_DIR` is unset.
 - EgoSchema falls back to Hugging Face subset metadata and downloads required videos on demand if no local EgoSchema assets are configured.
-- VideoEspresso RL reproduction can synthesize a local MC train JSON from the public open-ended train file via `scripts/repro/prepare_videoespresso_mc_train.py`.
+- VideoEspresso RL reproduction can synthesize a local MC train JSON from the public open-ended train file via `scripts/prepare_videoespresso_mc_train.py`.
 
 ### Plug-and-play evaluation (NExT-QA)
 
 ```bash
 # SGLang backend (default)
-ENGINE=sglang ./examples/revise/run_revise_nextqa_eval.sh
+ENGINE=sglang ./revise/run_revise_nextqa_eval.sh
 
 # vLLM backend
-ENGINE=vllm ./examples/revise/run_revise_nextqa_eval.sh --config-name revise_nextqa_eval_vllm
+ENGINE=vllm ./revise/run_revise_nextqa_eval.sh --config-name revise_nextqa_eval_vllm
 
 # Smoke test (tiny sample, 4 GPUs)
-ENGINE=sglang ./examples/revise/run_revise_nextqa_smoke.sh
+ENGINE=sglang ./revise/run_revise_nextqa_smoke.sh
 ```
 
 ### RL fine-tuning (GRPO + EAGER reward)
 
 ```bash
-ENGINE=sglang ./examples/revise/run_revise_nextqa_grpo.sh
+ENGINE=sglang ./revise/run_revise_nextqa_grpo.sh
 ```
 
 All scripts invoke the same Hydra entry point under the hood:
 
 ```bash
 python3 -m verl.trainer.main_ppo \
-  --config-path $(pwd)/examples/revise/config \
+  --config-path $(pwd)/revise/config \
   --config-name <config_name> \
   actor_rollout_ref.rollout.name=sglang \
   [hydra overrides ...]
@@ -139,21 +137,21 @@ python3 -m verl.trainer.main_ppo \
 These scripts run REVISE plug-and-play evaluation directly via vLLM, independent of the `verl` trainer:
 
 ```bash
-python examples/revise/plug_and_play_nextqa_vllm.py           # NExT-QA
-python examples/revise/plug_and_play_egoschema_vllm.py         # EgoSchema
-python examples/revise/plug_and_play_videomme_lvbench_vllm.py  # Video-MME / LVBench
-python examples/revise/plug_and_play_lvbench_hf.py             # LVBench (HF backend)
-python examples/revise/oneshot_lvbench_hf.py                   # One-shot baseline
-python examples/revise/eval_nextqa_caption_vllm.py             # Caption-only baseline
+python revise/plug_and_play_nextqa_vllm.py           # NExT-QA
+python revise/plug_and_play_egoschema_vllm.py         # EgoSchema
+python revise/plug_and_play_videomme_lvbench_vllm.py  # Video-MME / LVBench
+python revise/plug_and_play_lvbench_hf.py             # LVBench (HF backend)
+python revise/oneshot_lvbench_hf.py                   # One-shot baseline
+python revise/eval_nextqa_caption_vllm.py             # Caption-only baseline
 ```
 
 ## Repository Structure
 
 ```
-examples/
-  revise/          # REVISE evaluation scripts, shell runners, Hydra configs
-    config/        #   YAML configs for eval / GRPO / ablations
-  videoagent/      # VideoAgent baseline implementations
+revise/            # REVISE evaluation scripts, shell runners, Hydra configs
+  config/          #   YAML configs for eval / GRPO / ablations
+scripts/           # Reproduction tooling: asset download, doctor, paper suite
+tests/             # Unit tests
 
 verl/
   trainer/
@@ -176,7 +174,7 @@ verl/
 
 ## Datasets
 
-Dataset paths are configured in `examples/revise/config/*.yaml`. Supported benchmarks:
+Dataset paths are configured in `revise/config/*.yaml`. Supported benchmarks:
 
 | Dataset | Format | Key config fields |
 |---------|--------|-------------------|
@@ -191,7 +189,7 @@ Dataset paths are configured in `examples/revise/config/*.yaml`. Supported bench
 The project uses [Hydra](https://hydra.cc/) for configuration management. Configs are composed from:
 
 1. **Base config** at `verl/trainer/config/ppo_trainer.yaml` (actor, rollout, critic, algorithm defaults)
-2. **Experiment configs** at `examples/revise/config/` that override the base
+2. **Experiment configs** at `revise/config/` that override the base
 
 Key REVISE-specific settings live under `actor_rollout_ref.rollout.revise`:
 
