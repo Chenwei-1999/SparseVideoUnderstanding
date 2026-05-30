@@ -3,31 +3,16 @@
 from __future__ import annotations
 
 import random
-import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from revise.pnp_protocols import Backend, Dataset, LoopConfig, RunStats
 from revise.pnp_utils import (
-    ANSWER_RE,
-    SELECT_RE,
-    SUMMARIZE_RE,
-    THINK_RE,
-    contains_banned_example,
-    dedupe_preserve_order,
-    extract_tag,
-    format_intervals,
-    in_intervals,
-    is_placeholder,
     maybe_log_jsonl,
-    normalize_answer_letter,
-    parse_int_list,
     propose_candidate_frames,
     sample_uniform_indices,
-    summary_has_ohrpu,
     truncate_text,
-    unseen_intervals,
 )
 
 
@@ -41,26 +26,17 @@ class SampleOutcome:
     terminated_invalid_action: bool
 
 
-def _frames_has_range_syntax(frames_text: str) -> bool:
-    if not frames_text:
-        return False
-    # Common failure mode: model copies allowed ranges like "4-182" into <select>.
-    return bool(re.search(r"\d+\s*[-–—]\s*\d+", frames_text))
+_LOG_PREFIX_FIELDS = ("sample_id", "qid", "video_id", "video_path")
+_LOG_QUESTION_FIELDS = ("question", "choices", "ground_truth_idx")
 
 
-def _summary_has_stale_boilerplate(summary_text: str, *, seen_count: int) -> bool:
-    if not summary_text or seen_count <= 0:
-        return False
-    s = re.sub(r"\s+", " ", str(summary_text)).strip().lower()
-    if "has not seen any frames yet" in s:
-        return True
-    if re.search(r"\bhas not seen any (frame|frames|caption|captions) yet\b", s):
-        return True
-    if "no frames yet" in s:
-        return True
-    if "no captions yet" in s:
-        return True
-    return False
+def _select_log_fields(fields: dict[str, Any], names: tuple[str, ...]) -> dict[str, Any]:
+    return {name: fields[name] for name in names if name in fields}
+
+
+def _extra_log_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    known = set(_LOG_PREFIX_FIELDS) | set(_LOG_QUESTION_FIELDS)
+    return {name: value for name, value in fields.items() if name not in known}
 
 
 def run_sample(
@@ -77,12 +53,16 @@ def run_sample(
 ) -> SampleOutcome:
     _ = run
     seen_frames: list[int] = []
-    frame_count = sample.frame_count
+    video_path = dataset.video_path(sample)
+    video_id = dataset.video_id(sample)
+    sample_frame_count = dataset.frame_count(sample)
+    frame_count = sample_frame_count
+    sample_log_fields = dataset.log_fields(sample)
     if frame_count <= 0 and getattr(cfg, "observation_mode", "image") != "caption":
         try:
             import decord
 
-            vr = decord.VideoReader(sample.video_path, ctx=decord.cpu(0))
+            vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
             frame_count = int(len(vr))
         except Exception:
             frame_count = 0
@@ -92,7 +72,7 @@ def run_sample(
 
     video_captions: dict[int, str] = {}
     if getattr(cfg, "captions_dir", None) and getattr(cfg, "caption_include", "none") != "none":
-        video_captions = dataset.load_video_captions(str(cfg.captions_dir), sample.video_id)
+        video_captions = dataset.load_video_captions(str(cfg.captions_dir), video_id)
 
     summary_state = (
         "P: I will summarize what has been shown so far; "
@@ -116,15 +96,15 @@ def run_sample(
             try:
                 import decord
 
-                vr = decord.VideoReader(sample.video_path, ctx=decord.cpu(0))
+                vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
                 video_len = int(len(vr))
                 fps = float(vr.get_avg_fps()) if hasattr(vr, "get_avg_fps") else 0.0
                 if fps and fps > 0 and video_len > 0:
                     frame_count = max(1, int(video_len / fps))
             except Exception:
-                frame_count = max(1, int(sample.frame_count) if int(sample.frame_count) > 0 else 1)
+                frame_count = max(1, int(sample_frame_count) if int(sample_frame_count) > 0 else 1)
     elif video_captions:
-        fps = dataset.get_video_fps(sample.video_path)
+        fps = dataset.get_video_fps(video_path)
 
     def _caption_for_index(idx: int) -> str:
         if not video_captions:
@@ -227,20 +207,16 @@ def run_sample(
             )
             stats.total_model_calls += 1
 
-            frames_tag = extract_tag(raw, SELECT_RE)
+            frames_tag = dataset.parse_select(raw)
             requested_raw_frames: Optional[list[int]] = None
             requested_mapped_frames: Optional[list[int]] = None
             if frames_tag is not None:
-                requested_raw_frames = dedupe_preserve_order(parse_int_list(frames_tag))
+                requested_raw_frames = dataset.parse_select_frames(frames_tag)
                 if bool(cfg.use_candidate_frame_ids) and candidate_next_frames:
-                    mapped: list[int] = []
-                    invalid_id = False
-                    for cid in requested_raw_frames:
-                        if 1 <= cid <= len(candidate_next_frames):
-                            mapped.append(int(candidate_next_frames[cid - 1]))
-                        else:
-                            invalid_id = True
-                    requested_mapped_frames = None if invalid_id else dedupe_preserve_order(mapped)
+                    requested_mapped_frames = dataset.map_candidate_frame_ids(
+                        requested_raw_frames,
+                        candidate_next_frames,
+                    )
                 else:
                     requested_mapped_frames = requested_raw_frames
 
@@ -248,16 +224,12 @@ def run_sample(
                 cfg.log_jsonl,
                 {
                     "ts": time.time(),
-                    "sample_id": sample.sample_id,
-                    "qid": sample.qid,
-                    "video_id": sample.video_id,
-                    "video_path": sample.video_path,
+                    **_select_log_fields(sample_log_fields, _LOG_PREFIX_FIELDS),
                     "round_idx": round_idx,
                     "retry_idx": retry_idx,
                     "retry_feedback": retry_feedback,
-                    "question": sample.question,
-                    "choices": sample.choices,
-                    "ground_truth_idx": sample.answer_idx,
+                    **_select_log_fields(sample_log_fields, _LOG_QUESTION_FIELDS),
+                    **_extra_log_fields(sample_log_fields),
                     "observation_mode": observation_mode,
                     "use_candidate_frames": bool(getattr(cfg, "use_candidate_frames", False)),
                     "use_candidate_frame_ids": bool(cfg.use_candidate_frame_ids),
@@ -278,26 +250,22 @@ def run_sample(
                 },
             )
 
-            summary = extract_tag(raw, SUMMARIZE_RE)
-            if (
-                summary
-                and (not is_placeholder(summary))
-                and (not contains_banned_example(summary))
-                and summary_has_ohrpu(summary)
-                and (not _summary_has_stale_boilerplate(summary, seen_count=len(seen_frames)))
-            ):
+            summary = dataset.parse_summary(raw)
+            if dataset.should_commit_summary(summary, seen_count=len(seen_frames)):
                 summary_state = summary
 
-            think = extract_tag(raw, THINK_RE)
+            think = dataset.parse_think(raw)
             if think is None:
                 stats.invalid_outputs += 1
                 terminated_reason = "missing_think"
                 if retry_idx < int(cfg.max_retries_per_round):
                     stats.total_retries += 1
                     retry_feedback = dataset.retry_feedback_text(
-                        "Invalid response: every response MUST begin with a <think>...</think> reasoning trace, "
-                        "then either <summarize> + <select> (request) or <answer> (final).",
+                        "missing_think",
                         force_answer=bool(cfg.force_final_answer and round_idx >= cfg.max_rounds),
+                        max_frames_per_round=cfg.max_frames_per_round,
+                        frame_count=frame_count,
+                        seen_frames=seen_frames,
                     )
                     attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                     continue
@@ -318,18 +286,20 @@ def run_sample(
                 )
                 break
 
-            answer = extract_tag(raw, ANSWER_RE)
+            answer = dataset.parse_answer(raw)
             if answer:
-                answer_letter = normalize_answer_letter(answer, len(sample.choices))
+                answer_letter = dataset.normalize_answer(sample, answer)
                 if answer_letter is None:
                     stats.invalid_outputs += 1
                     terminated_reason = "invalid_answer_letter"
                     if retry_idx < int(cfg.max_retries_per_round):
                         stats.total_retries += 1
                         retry_feedback = dataset.retry_feedback_text(
-                            "Invalid response: <answer> must be exactly ONE option letter (A/B/C/D/E). "
-                            "Do not output words or a sentence.",
+                            "invalid_answer_letter",
                             force_answer=True,
+                            max_frames_per_round=cfg.max_frames_per_round,
+                            frame_count=frame_count,
+                            seen_frames=seen_frames,
                         )
                         attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                         continue
@@ -354,8 +324,11 @@ def run_sample(
                     if retry_idx < int(cfg.max_retries_per_round):
                         stats.total_retries += 1
                         retry_feedback = dataset.retry_feedback_text(
-                            "Invalid response: do NOT answer yet. Request more frames using <summarize>...</summarize> and <select>...</select>.",
+                            "early_answer_disallowed",
                             force_answer=False,
+                            max_frames_per_round=cfg.max_frames_per_round,
+                            frame_count=frame_count,
+                            seen_frames=seen_frames,
                         )
                         attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                         answer_letter = None
@@ -380,7 +353,7 @@ def run_sample(
                 # (captured above when a valid <summarize> was present on a Select round).
                 break
 
-            frames_text = extract_tag(raw, SELECT_RE)
+            frames_text = dataset.parse_select(raw)
 
             # If we didn't answer, we must request frames, with a valid summary.
             if frames_text is None:
@@ -389,9 +362,11 @@ def run_sample(
                 if retry_idx < int(cfg.max_retries_per_round):
                     stats.total_retries += 1
                     retry_feedback = dataset.retry_feedback_text(
-                        "Invalid response: missing <select> tag for requesting more frames. "
-                        "Remember: <select> must list NEW frame indices to view NEXT (not already seen).",
+                        "missing_frames_tag",
                         force_answer=bool(cfg.force_final_answer and round_idx >= cfg.max_rounds),
+                        max_frames_per_round=cfg.max_frames_per_round,
+                        frame_count=frame_count,
+                        seen_frames=seen_frames,
                     )
                     attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                     continue
@@ -403,68 +378,68 @@ def run_sample(
                 next_frames = sample_uniform_indices(frame_count, 1)
                 break
 
-            if summary is None or is_placeholder(summary) or contains_banned_example(summary) or (not summary_has_ohrpu(summary)):
+            if not dataset.is_select_summary_valid(summary, seen_count=len(seen_frames)):
                 stats.invalid_outputs += 1
                 terminated_reason = "invalid_select_summary"
                 if retry_idx < int(cfg.max_retries_per_round):
                     stats.total_retries += 1
                     retry_feedback = dataset.retry_feedback_text(
-                        "Invalid response: include a meaningful <summarize> with P/O/H/U/R in that exact order "
-                        "(no placeholders like '.../none/unknown').",
+                        "invalid_select_summary",
                         force_answer=bool(cfg.force_final_answer and round_idx >= cfg.max_rounds),
+                        max_frames_per_round=cfg.max_frames_per_round,
+                        frame_count=frame_count,
+                        seen_frames=seen_frames,
                     )
                     attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                     continue
-            if summary is not None and _summary_has_stale_boilerplate(summary, seen_count=len(seen_frames)):
+            if dataset.is_summary_stale(summary, seen_count=len(seen_frames)):
                 stats.invalid_outputs += 1
                 terminated_reason = "stale_select_summary"
                 if retry_idx < int(cfg.max_retries_per_round):
                     stats.total_retries += 1
                     retry_feedback = dataset.retry_feedback_text(
-                        "Invalid response: the <summarize> claims no frames/captions were seen, but evidence was shown. "
-                        "Rewrite <summarize> to reflect what was observed so far (P/O/H/U/R), then request frames.",
+                        "stale_select_summary",
                         force_answer=bool(cfg.force_final_answer and round_idx >= cfg.max_rounds),
+                        max_frames_per_round=cfg.max_frames_per_round,
+                        frame_count=frame_count,
+                        seen_frames=seen_frames,
                     )
                     attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                     continue
 
-            if (not bool(cfg.use_candidate_frame_ids)) and _frames_has_range_syntax(frames_text):
+            if (not bool(cfg.use_candidate_frame_ids)) and dataset.select_has_range_syntax(frames_text):
                 stats.invalid_outputs += 1
                 terminated_reason = "frames_range_syntax"
                 if retry_idx < int(cfg.max_retries_per_round):
                     stats.total_retries += 1
                     retry_feedback = dataset.retry_feedback_text(
-                        "Invalid response: <select> must be a comma-separated list of integers only "
-                        "(NO ranges like '4-182', no hyphens). Choose up to {k} NEW frames.".format(
-                            k=cfg.max_frames_per_round
-                        ),
+                        "frames_range_syntax",
                         force_answer=bool(cfg.force_final_answer and round_idx >= cfg.max_rounds),
+                        max_frames_per_round=cfg.max_frames_per_round,
+                        frame_count=frame_count,
+                        seen_frames=seen_frames,
                     )
                     attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                     continue
 
-            requested = dedupe_preserve_order(parse_int_list(frames_text))
+            requested = dataset.parse_select_frames(frames_text)
             if bool(cfg.use_candidate_frame_ids) and candidate_next_frames:
-                mapped: list[int] = []
-                invalid_id = False
-                for cid in requested:
-                    if 1 <= cid <= len(candidate_next_frames):
-                        mapped.append(int(candidate_next_frames[cid - 1]))
-                    else:
-                        invalid_id = True
-                if invalid_id:
+                mapped = dataset.map_candidate_frame_ids(requested, candidate_next_frames)
+                if mapped is None:
                     stats.invalid_outputs += 1
                     terminated_reason = "frames_out_of_range"
                     if retry_idx < int(cfg.max_retries_per_round):
                         stats.total_retries += 1
                         retry_feedback = dataset.retry_feedback_text(
-                            "Invalid response: when Candidate Frame IDs are provided, <select> must contain only "
-                            "IDs in the allowed range [1..K] (comma-separated integers).",
+                            "frames_out_of_range",
                             force_answer=bool(cfg.force_final_answer and round_idx >= cfg.max_rounds),
+                            max_frames_per_round=cfg.max_frames_per_round,
+                            frame_count=frame_count,
+                            seen_frames=seen_frames,
                         )
                         attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                         continue
-                    if cfg.strict_actions and not bool(getattr(cfg, "fallback_on_invalid_candidate_ids", True)):
+                    if cfg.strict_actions and not bool(cfg.fallback_on_invalid_candidate_ids):
                         stats.invalid_action_terminated += 1
                         terminated_invalid_action = True
                         answer_letter = None
@@ -483,38 +458,41 @@ def run_sample(
                     )
                     break
                 else:
-                    requested = dedupe_preserve_order(mapped)
-                    requested = [i for i in requested if 0 <= i < frame_count and i not in seen_frames]
+                    requested = mapped
+                    requested, _ = dataset.filter_requested_frames(
+                        requested,
+                        frame_count=frame_count,
+                        seen_frames=seen_frames,
+                        candidate_frames=[],
+                        require_candidate_frames=False,
+                    )
             else:
-                if bool(getattr(cfg, "require_candidate_frames", False)) and candidate_next_frames:
-                    allowed = {int(i) for i in candidate_next_frames}
-                    disallowed = [i for i in requested if int(i) not in allowed]
-                    if disallowed:
-                        stats.invalid_outputs += 1
-                        terminated_reason = "frames_not_in_candidates"
-                        if retry_idx < int(cfg.max_retries_per_round):
-                            stats.total_retries += 1
-                            retry_feedback = dataset.retry_feedback_text(
-                                "Invalid response: requested frames must be chosen ONLY from the candidate unseen frame list/ranges provided.",
-                                force_answer=bool(cfg.force_final_answer and round_idx >= cfg.max_rounds),
-                            )
-                            attempt_user_text = f"{user_text}\n\n{retry_feedback}"
-                            continue
-                        if cfg.strict_actions:
-                            stats.invalid_action_terminated += 1
-                            terminated_invalid_action = True
-                            answer_letter = None
-                            break
-                        requested = []
-                    else:
-                        requested = [i for i in requested if 0 <= i < frame_count and i not in seen_frames and int(i) in allowed]
-                else:
-                    allowed_ranges = unseen_intervals(frame_count, seen_frames)
-                    requested = [
-                        i
-                        for i in requested
-                        if 0 <= i < frame_count and i not in seen_frames and in_intervals(i, allowed_ranges)
-                    ]
+                requested, select_error = dataset.filter_requested_frames(
+                    requested,
+                    frame_count=frame_count,
+                    seen_frames=seen_frames,
+                    candidate_frames=candidate_next_frames,
+                    require_candidate_frames=bool(getattr(cfg, "require_candidate_frames", False)),
+                )
+                if select_error == "frames_not_in_candidates":
+                    stats.invalid_outputs += 1
+                    terminated_reason = "frames_not_in_candidates"
+                    if retry_idx < int(cfg.max_retries_per_round):
+                        stats.total_retries += 1
+                        retry_feedback = dataset.retry_feedback_text(
+                            "frames_not_in_candidates",
+                            force_answer=bool(cfg.force_final_answer and round_idx >= cfg.max_rounds),
+                            max_frames_per_round=cfg.max_frames_per_round,
+                            frame_count=frame_count,
+                            seen_frames=seen_frames,
+                        )
+                        attempt_user_text = f"{user_text}\n\n{retry_feedback}"
+                        continue
+                    if cfg.strict_actions:
+                        stats.invalid_action_terminated += 1
+                        terminated_invalid_action = True
+                        answer_letter = None
+                        break
 
             if requested and len(requested) > int(cfg.max_frames_per_round):
                 stats.invalid_outputs += 1
@@ -525,17 +503,12 @@ def run_sample(
                 terminated_reason = "invalid_frames"
                 if retry_idx < int(cfg.max_retries_per_round):
                     stats.total_retries += 1
-                    candidate_text = (
-                        " Allowed unseen ranges: "
-                        f"{format_intervals(unseen_intervals(frame_count, seen_frames))}."
-                    )
                     retry_feedback = dataset.retry_feedback_text(
-                        "Invalid response: requested frames must be NEW and within range. "
-                        "In <select>, output 1–{k} comma-separated integers NOT in Seen frames.".format(
-                            k=cfg.max_frames_per_round
-                        )
-                        + candidate_text,
+                        "invalid_frames",
                         force_answer=bool(cfg.force_final_answer and round_idx >= cfg.max_rounds),
+                        max_frames_per_round=cfg.max_frames_per_round,
+                        frame_count=frame_count,
+                        seen_frames=seen_frames,
                     )
                     attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                     continue
@@ -594,15 +567,11 @@ def run_sample(
             cfg.log_jsonl,
             {
                 "ts": time.time(),
-                "sample_id": sample.sample_id,
-                "qid": sample.qid,
-                "video_id": sample.video_id,
-                "video_path": sample.video_path,
+                **_select_log_fields(sample_log_fields, _LOG_PREFIX_FIELDS),
                 "round_idx": cfg.max_rounds + 1,
                 "forced_answer": True,
-                "question": sample.question,
-                "choices": sample.choices,
-                "ground_truth_idx": sample.answer_idx,
+                **_select_log_fields(sample_log_fields, _LOG_QUESTION_FIELDS),
+                **_extra_log_fields(sample_log_fields),
                 "seen_frames": seen_frames,
                 "current_frames": last_frames,
                 "summary_in": summary_state,
@@ -611,9 +580,9 @@ def run_sample(
                 "raw_output": raw,
             },
         )
-        answer = extract_tag(raw, ANSWER_RE)
+        answer = dataset.parse_answer(raw)
         if answer:
-            answer_letter = normalize_answer_letter(answer, len(sample.choices))
+            answer_letter = dataset.normalize_answer(sample, answer)
 
     return SampleOutcome(
         answer_letter=answer_letter,

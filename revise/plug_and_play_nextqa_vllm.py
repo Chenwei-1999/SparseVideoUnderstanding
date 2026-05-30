@@ -89,23 +89,24 @@ from revise.pnp_utils import (
     wandb_log,
 )
 
-_CAPTION_CACHE: dict[str, dict[int, str]] = {}
+_CAPTION_CACHE: dict[tuple[str, str], dict[int, str]] = {}
 _FPS_CACHE: dict[str, float] = {}
 
 
 def _load_video_captions(captions_dir: str, video_id: str) -> dict[int, str]:
-    cached = _CAPTION_CACHE.get(video_id)
+    cache_key = (str(captions_dir), str(video_id))
+    cached = _CAPTION_CACHE.get(cache_key)
     if cached is not None:
         return cached
     path = os.path.join(captions_dir, f"{video_id}_cap.json")
     if not os.path.exists(path):
-        _CAPTION_CACHE[video_id] = {}
+        _CAPTION_CACHE[cache_key] = {}
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
     except Exception:
-        _CAPTION_CACHE[video_id] = {}
+        _CAPTION_CACHE[cache_key] = {}
         return {}
     captions: dict[int, str] = {}
     if isinstance(raw, dict):
@@ -116,7 +117,7 @@ def _load_video_captions(captions_dir: str, video_id: str) -> dict[int, str]:
                 continue
             if isinstance(v, str):
                 captions[idx] = v.strip()
-    _CAPTION_CACHE[video_id] = captions
+    _CAPTION_CACHE[cache_key] = captions
     return captions
 
 
@@ -505,6 +506,40 @@ def _chat_once(
 
 
 class NextQADataset:
+    def video_path(self, sample: NextQASample) -> str:
+        return sample.video_path
+
+    def frame_count(self, sample: NextQASample) -> int:
+        return sample.frame_count
+
+    def video_id(self, sample: NextQASample) -> str:
+        return sample.video_id
+
+    def num_choices(self, sample: NextQASample) -> int:
+        return len(sample.choices)
+
+    def normalize_answer(self, sample: NextQASample, answer_text: str) -> Optional[str]:
+        return normalize_answer_letter(answer_text, self.num_choices(sample))
+
+    def ground_truth_letter(self, sample: NextQASample) -> Optional[str]:
+        if 0 <= int(sample.answer_idx) < self.num_choices(sample):
+            return chr(ord("A") + int(sample.answer_idx))
+        return None
+
+    def is_correct(self, sample: NextQASample, pred_letter: str) -> bool:
+        return pred_letter == self.ground_truth_letter(sample)
+
+    def log_fields(self, sample: NextQASample) -> dict[str, Any]:
+        return {
+            "sample_id": sample.sample_id,
+            "qid": sample.qid,
+            "video_id": sample.video_id,
+            "video_path": sample.video_path,
+            "question": sample.question,
+            "choices": sample.choices,
+            "ground_truth_idx": sample.answer_idx,
+        }
+
     def format_question(self, sample: NextQASample) -> str:
         return _format_question(sample.question, sample.choices)
 
@@ -525,7 +560,75 @@ class NextQADataset:
     def sample_unseen_frames(self, frame_count: int, seen: set[int], k: int, rng: random.Random) -> list[int]:
         return _sample_unseen_frames(frame_count, seen, k, rng=rng)
 
-    def retry_feedback_text(self, feedback: str, *, force_answer: bool = False) -> str:
+    def retry_feedback_text(
+        self,
+        reason: str,
+        *,
+        force_answer: bool = False,
+        max_frames_per_round: int = 0,
+        frame_count: int = 0,
+        seen_frames: Optional[list[int]] = None,
+    ) -> str:
+        if reason == "missing_think":
+            feedback = (
+                "Invalid response: every response MUST begin with a <think>...</think> reasoning trace, "
+                "then either <summarize> + <select> (request) or <answer> (final)."
+            )
+        elif reason == "invalid_answer_letter":
+            feedback = (
+                "Invalid response: <answer> must be exactly ONE option letter (A/B/C/D/E). "
+                "Do not output words or a sentence."
+            )
+        elif reason == "early_answer_disallowed":
+            feedback = (
+                "Invalid response: do NOT answer yet. Request more frames using "
+                "<summarize>...</summarize> and <select>...</select>."
+            )
+        elif reason == "missing_frames_tag":
+            feedback = (
+                "Invalid response: missing <select> tag for requesting more frames. "
+                "Remember: <select> must list NEW frame indices to view NEXT (not already seen)."
+            )
+        elif reason == "invalid_select_summary":
+            feedback = (
+                "Invalid response: include a meaningful <summarize> with P/O/H/U/R in that exact order "
+                "(no placeholders like '.../none/unknown')."
+            )
+        elif reason == "stale_select_summary":
+            feedback = (
+                "Invalid response: the <summarize> claims no frames/captions were seen, but evidence was shown. "
+                "Rewrite <summarize> to reflect what was observed so far (P/O/H/U/R), then request frames."
+            )
+        elif reason == "frames_range_syntax":
+            feedback = (
+                "Invalid response: <select> must be a comma-separated list of integers only "
+                "(NO ranges like '4-182', no hyphens). Choose up to {k} NEW frames.".format(
+                    k=max_frames_per_round
+                )
+            )
+        elif reason == "frames_out_of_range":
+            feedback = (
+                "Invalid response: when Candidate Frame IDs are provided, <select> must contain only "
+                "IDs in the allowed range [1..K] (comma-separated integers)."
+            )
+        elif reason == "frames_not_in_candidates":
+            feedback = (
+                "Invalid response: requested frames must be chosen ONLY from the candidate unseen frame list/ranges provided."
+            )
+        elif reason == "invalid_frames":
+            candidate_text = (
+                " Allowed unseen ranges: "
+                f"{format_intervals(unseen_intervals(frame_count, seen_frames or []))}."
+            )
+            feedback = (
+                "Invalid response: requested frames must be NEW and within range. "
+                "In <select>, output 1–{k} comma-separated integers NOT in Seen frames.".format(
+                    k=max_frames_per_round
+                )
+                + candidate_text
+            )
+        else:
+            feedback = reason
         return _retry_feedback_text(feedback, force_answer=force_answer)
 
     def load_video_captions(self, captions_dir: str, video_id: str) -> dict[int, str]:
@@ -536,6 +639,92 @@ class NextQADataset:
 
     def caption_key_for_frame_index(self, frame_idx: int, fps: float) -> int:
         return _caption_key_for_frame_index(frame_idx, fps)
+
+    def parse_think(self, raw: str) -> Optional[str]:
+        return extract_tag(raw, THINK_RE)
+
+    def parse_summary(self, raw: str) -> Optional[str]:
+        return extract_tag(raw, SUMMARIZE_RE)
+
+    def parse_answer(self, raw: str) -> Optional[str]:
+        return extract_tag(raw, ANSWER_RE)
+
+    def parse_select(self, raw: str) -> Optional[str]:
+        return extract_tag(raw, SELECT_RE)
+
+    def should_commit_summary(self, summary: Optional[str], *, seen_count: int) -> bool:
+        return (
+            bool(summary)
+            and (not is_placeholder(summary))
+            and (not contains_banned_example(summary))
+            and summary_has_ohrpu(summary)
+            and (not _summary_has_stale_boilerplate(summary, seen_count=seen_count))
+        )
+
+    def is_select_summary_valid(self, summary: Optional[str], *, seen_count: int) -> bool:
+        _ = seen_count
+        return (
+            summary is not None
+            and (not is_placeholder(summary))
+            and (not contains_banned_example(summary))
+            and summary_has_ohrpu(summary)
+        )
+
+    def is_summary_stale(self, summary: Optional[str], *, seen_count: int) -> bool:
+        if summary is None:
+            return False
+        return _summary_has_stale_boilerplate(summary, seen_count=seen_count)
+
+    def select_has_range_syntax(self, frames_text: str) -> bool:
+        return _frames_has_range_syntax(frames_text)
+
+    def parse_select_frames(self, frames_text: str) -> list[int]:
+        return dedupe_preserve_order(parse_int_list(frames_text))
+
+    def map_candidate_frame_ids(
+        self,
+        requested_ids: list[int],
+        candidate_frames: list[int],
+    ) -> Optional[list[int]]:
+        mapped: list[int] = []
+        for cid in requested_ids:
+            if 1 <= cid <= len(candidate_frames):
+                mapped.append(int(candidate_frames[cid - 1]))
+            else:
+                return None
+        return dedupe_preserve_order(mapped)
+
+    def filter_requested_frames(
+        self,
+        requested_frames: list[int],
+        *,
+        frame_count: int,
+        seen_frames: list[int],
+        candidate_frames: list[int],
+        require_candidate_frames: bool = False,
+    ) -> tuple[list[int], Optional[str]]:
+        if require_candidate_frames and candidate_frames:
+            allowed = {int(i) for i in candidate_frames}
+            disallowed = [i for i in requested_frames if int(i) not in allowed]
+            if disallowed:
+                return [], "frames_not_in_candidates"
+            return (
+                [
+                    i
+                    for i in requested_frames
+                    if 0 <= i < frame_count and i not in seen_frames and int(i) in allowed
+                ],
+                None,
+            )
+        allowed_ranges = unseen_intervals(frame_count, seen_frames)
+        return (
+            [
+                i
+                for i in requested_frames
+                if 0 <= i < frame_count and i not in seen_frames and in_intervals(i, allowed_ranges)
+            ],
+            None,
+        )
 
 
 class VllmHttpBackend:
@@ -852,8 +1041,8 @@ def main() -> int:
             hide_seen_frames_in_prompt=bool(getattr(args, "hide_seen_frames_in_prompt", False)),
             log_jsonl=args.log_jsonl,
             seed=int(getattr(args, "seed", 0)),
+            fallback_on_invalid_candidate_ids=bool(args.fallback_on_invalid_candidate_ids),
         )
-        setattr(cfg, "fallback_on_invalid_candidate_ids", bool(args.fallback_on_invalid_candidate_ids))
         processed = stats.processed
         correct = stats.correct
         total_rounds = stats.total_rounds
@@ -880,10 +1069,8 @@ def main() -> int:
                     run=run,
                 )
 
-                if outcome.answer_letter is not None:
-                    pred_idx = ord(outcome.answer_letter) - ord("A")
-                    if pred_idx == sample.answer_idx:
-                        stats.correct += 1
+                if outcome.answer_letter is not None and ds.is_correct(sample, outcome.answer_letter):
+                    stats.correct += 1
                 stats.total_frames_used += len(outcome.seen_frames)
             except Exception as e:
                 stats.failed += 1
