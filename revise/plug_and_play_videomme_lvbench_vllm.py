@@ -480,9 +480,17 @@ class _BaseLongVideoDataset:
     def extract_frames(self, sample: MCVideoSample, indices: list[int]) -> list[Image.Image]:
         return extract_frames_1fps(self._ensure_video_path(sample), indices)
 
-    def oneshot_user_text(self, question_block: str, num_frames: int) -> str:
+    def oneshot_user_text(
+        self,
+        question_block: str,
+        num_frames: int,
+        *,
+        frame_indices: Optional[list[int]] = None,
+    ) -> str:
         # Single-round baseline prompt; kept byte-identical to the legacy
-        # ``oneshot_videomme_lvbench_vllm._build_user_text``.
+        # ``oneshot_videomme_lvbench_vllm._build_user_text``. This adapter
+        # enumerates frames by 1-based ordinal, so ``frame_indices`` is ignored.
+        _ = frame_indices
         lines: list[str] = []
         lines.append(question_block)
         lines.append("")

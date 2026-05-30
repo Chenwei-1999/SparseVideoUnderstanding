@@ -836,6 +836,74 @@ def _run_lvbench_hf(
     return summary
 
 
+def _oneshot_default_video_path(args: Any, sample: Any) -> str:
+    """Video-existence path for the videomme/lvbench one-shot launcher."""
+    cache_dir = getattr(args, "_pnp_oneshot_cache_dir")
+    return str(cache_dir / sample.video_key)
+
+
+def _oneshot_default_log_record(
+    args: Any,
+    sample: Any,
+    *,
+    outcome: Any,
+    pred: Optional[str],
+    is_correct: bool,
+    video_path: str,
+    split: str,
+) -> dict[str, Any]:
+    """Per-sample JSONL record for the videomme/lvbench one-shot launcher."""
+    return {
+        "ts": time.time(),
+        "dataset": sample.dataset,
+        "split": split,
+        "uid": sample.uid,
+        "video_key": sample.video_key,
+        "video_path": video_path,
+        "time_reference": sample.time_reference,
+        "sample_id": sample.sample_id,
+        "question": sample.question,
+        "options": sample.options,
+        "answer_gt": sample.answer_letter,
+        "pred_answer": pred,
+        "raw_output": outcome.raw_output,
+        "correct": bool(is_correct),
+    }
+
+
+def _oneshot_default_build_summary(
+    args: Any,
+    *,
+    samples_total: int,
+    answered: int,
+    correct: int,
+    failed: int,
+    frames_used: int,
+    elapsed_s: float,
+    stats: RunStats,
+) -> dict[str, Any]:
+    """Top-level summary dict for the videomme/lvbench one-shot launcher.
+
+    Written directly as the summary-json payload (NOT nested under ``results``).
+    """
+    _ = frames_used
+    return {
+        "samples": samples_total,
+        "answered": answered,
+        "correct": correct,
+        "accuracy": float(correct / max(1, answered)),
+        "failed": failed,
+        "elapsed_s": float(elapsed_s),
+        "total_model_calls": stats.total_model_calls,
+        "prompt_log_jsonl": args.log_jsonl,
+        "cached_only": bool(getattr(args, "cached_only", False)),
+        "allow_missing_cached_videos": bool(getattr(args, "allow_missing_cached_videos", False)),
+        "cache_filter_total_samples": int(getattr(args, "_pnp_oneshot_cache_filter_total", 0)),
+        "cache_filter_missing_videos": int(getattr(args, "_pnp_oneshot_cache_filter_missing", 0)),
+        "cache_filter_missing_examples": list(getattr(args, "_pnp_oneshot_cache_filter_missing_examples", []) or []),
+    }
+
+
 def _run_oneshot(
     samples: list[Any],
     *,
@@ -849,27 +917,48 @@ def _run_oneshot(
     run: Any,
     args: Any,
 ) -> dict[str, Any]:
-    """Single-round baseline outer loop (oneshot_videomme_lvbench_vllm).
+    """Single-round baseline outer loop shared by every one-shot launcher.
 
-    Reproduces the legacy standalone launcher byte-for-byte: video-existence
+    The default behavior reproduces the legacy
+    ``oneshot_videomme_lvbench_vllm`` launcher byte-for-byte: video-existence
     skip (never downloads), one chat per sample via
     :func:`pnp_engine.run_sample_oneshot`, and the launcher's own top-level
     summary-json schema (NOT nested under ``results``).
+
+    Launchers whose log record / summary schema / video-path resolution differ
+    (lvbench_hf, local_mc) override the defaults via ``args`` hooks:
+
+    * ``_pnp_oneshot_video_path(sample) -> str`` — existence path (default:
+      ``cache_dir / sample.video_key``).
+    * ``_pnp_oneshot_skip_missing_video: bool`` — pre-skip samples whose video is
+      absent on disk (default ``True``); local-MC sets ``False`` so frame-probe
+      failures inside the engine count the sample as failed instead.
+    * ``_pnp_oneshot_log_record(sample, outcome, pred, is_correct, video_path,
+      split) -> dict`` — per-sample JSONL record (default: videomme/lvbench).
+    * ``_pnp_oneshot_build_summary(...) -> dict`` — final summary payload
+      (default: the legacy videomme/lvbench top-level schema).
     """
     _ = run
-    cache_dir = getattr(args, "_pnp_oneshot_cache_dir")
     split = getattr(args, "_pnp_split", getattr(args, "split", ""))
     resume_completed = int(getattr(args, "_pnp_oneshot_resume_completed", 0) or 0)
     restart_cb = getattr(args, "_pnp_oneshot_restart_server", None)
+    video_path_fn = getattr(args, "_pnp_oneshot_video_path", None)
+    log_record_fn = getattr(args, "_pnp_oneshot_log_record", None)
+    build_summary_fn = getattr(args, "_pnp_oneshot_build_summary", None)
+    skip_missing = bool(getattr(args, "_pnp_oneshot_skip_missing_video", True))
 
     start_t = time.time()
     correct = 0
     failed = 0
+    frames_used = 0
     printed_error = False
 
     for i, sample in enumerate(samples, start=1):
-        video_path = str(cache_dir / sample.video_key)
-        if not os.path.exists(video_path) or os.path.getsize(video_path) <= 0:
+        if video_path_fn is not None:
+            video_path = str(video_path_fn(sample))
+        else:
+            video_path = _oneshot_default_video_path(args, sample)
+        if skip_missing and (not os.path.exists(video_path) or os.path.getsize(video_path) <= 0):
             failed += 1
             continue
 
@@ -920,26 +1009,29 @@ def _run_oneshot(
         is_correct = pred is not None and dataset.is_correct(sample, pred)
         if is_correct:
             correct += 1
+        frames_used += len(outcome.frame_indices)
 
-        maybe_log_jsonl(
-            args.log_jsonl,
-            {
-                "ts": time.time(),
-                "dataset": sample.dataset,
-                "split": split,
-                "uid": sample.uid,
-                "video_key": sample.video_key,
-                "video_path": video_path,
-                "time_reference": sample.time_reference,
-                "sample_id": sample.sample_id,
-                "question": sample.question,
-                "options": sample.options,
-                "answer_gt": sample.answer_letter,
-                "pred_answer": pred,
-                "raw_output": outcome.raw_output,
-                "correct": bool(is_correct),
-            },
-        )
+        if log_record_fn is not None:
+            record = log_record_fn(
+                sample,
+                outcome=outcome,
+                pred=pred,
+                is_correct=is_correct,
+                video_path=video_path,
+                split=split,
+            )
+        else:
+            record = _oneshot_default_log_record(
+                args,
+                sample,
+                outcome=outcome,
+                pred=pred,
+                is_correct=is_correct,
+                video_path=video_path,
+                split=split,
+            )
+        if record is not None:
+            maybe_log_jsonl(args.log_jsonl, record)
 
         if i % 50 == 0:
             answered = i - failed
@@ -952,22 +1044,29 @@ def _run_oneshot(
 
     total = len(samples) + resume_completed
     answered = max(0, total - failed)
-    results = {
-        "samples": total,
-        "answered": answered,
-        "correct": correct,
-        "accuracy": float(correct / max(1, answered)),
-        "failed": failed,
-        "elapsed_s": float(time.time() - start_t),
-        "total_model_calls": stats.total_model_calls,
-        "prompt_log_jsonl": args.log_jsonl,
-        "cached_only": bool(getattr(args, "cached_only", False)),
-        "allow_missing_cached_videos": bool(getattr(args, "allow_missing_cached_videos", False)),
-        "cache_filter_total_samples": int(getattr(args, "_pnp_oneshot_cache_filter_total", 0)),
-        "cache_filter_missing_videos": int(getattr(args, "_pnp_oneshot_cache_filter_missing", 0)),
-        "cache_filter_missing_examples": list(getattr(args, "_pnp_oneshot_cache_filter_missing_examples", []) or []),
-    }
-    payload = json.dumps(results, indent=2, ensure_ascii=False)
+    elapsed_s = time.time() - start_t
+    if build_summary_fn is not None:
+        summary = build_summary_fn(
+            samples_total=total,
+            answered=answered,
+            correct=correct,
+            failed=failed,
+            frames_used=frames_used,
+            elapsed_s=elapsed_s,
+            stats=stats,
+        )
+    else:
+        summary = _oneshot_default_build_summary(
+            args,
+            samples_total=total,
+            answered=answered,
+            correct=correct,
+            failed=failed,
+            frames_used=frames_used,
+            elapsed_s=elapsed_s,
+            stats=stats,
+        )
+    payload = json.dumps(summary, indent=2, ensure_ascii=False)
     print(payload, flush=True)
     if args.summary_json:
         out_dir = os.path.dirname(args.summary_json)
@@ -975,7 +1074,7 @@ def _run_oneshot(
             os.makedirs(out_dir, exist_ok=True)
         with open(args.summary_json, "w", encoding="utf-8") as f:
             f.write(payload + "\n")
-    return results
+    return summary
 
 
 def run_eval(

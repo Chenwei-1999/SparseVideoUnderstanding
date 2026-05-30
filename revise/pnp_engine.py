@@ -77,7 +77,7 @@ def run_sample_oneshot(
             answer_letter=None, raw_output=None, frame_indices=frame_indices, failed_reason="no_frames"
         )
 
-    user_text = dataset.oneshot_user_text(question_block, len(images))
+    user_text = dataset.oneshot_user_text(question_block, len(images), frame_indices=frame_indices)
     raw = backend.chat(
         base_url=base_url,
         model_id=model_id,
