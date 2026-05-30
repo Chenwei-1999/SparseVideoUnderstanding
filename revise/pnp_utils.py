@@ -1105,3 +1105,104 @@ def suffix_path(path: str, suffix: str) -> str:
     """Add a suffix before the file extension (e.g. ``'log.jsonl'`` -> ``'log.shard0of4.jsonl'``)."""
     root, ext = os.path.splitext(path)
     return f"{root}{suffix}{ext}" if ext else f"{path}{suffix}"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible chat completion (shared by the plug-and-play launchers)
+# ---------------------------------------------------------------------------
+
+
+def build_chat_content(
+    user_text: str,
+    images: list[Image.Image],
+    *,
+    max_edge: int = 0,
+    quality: int = 90,
+) -> list[dict[str, Any]]:
+    """Interleave text segments with base64 images at ``<image>`` placeholders.
+
+    The user text carries ``<image>`` markers produced by the prompt builder;
+    each marker is replaced by the next image so the model sees frames in
+    position. Any images beyond the number of placeholders are appended at the
+    end (defensive: keeps every frame visible even if the text drifts).
+
+    *max_edge* / *quality* tune the JPEG encoding so high-resolution callers can
+    cap payload size; the default (no resize, q=90) preserves the original
+    NExT-QA behavior.
+    """
+    parts = user_text.split("<image>") if images else [user_text]
+    content: list[dict[str, Any]] = []
+    for i, part in enumerate(parts):
+        if part:
+            content.append({"type": "text", "text": part})
+        if i < len(parts) - 1 and i < len(images):
+            b64 = b64_jpeg(images[i], max_edge=max_edge, quality=quality)
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+    for j in range(len(parts) - 1, len(images)):
+        b64 = b64_jpeg(images[j], max_edge=max_edge, quality=quality)
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+    return content
+
+
+def chat_once(
+    base_url: str,
+    model_id: str,
+    system_prompt: str,
+    user_text: str,
+    images: list[Image.Image],
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    timeout_s: int,
+    *,
+    max_edge: int = 0,
+    quality: int = 90,
+) -> str:
+    """Issue one OpenAI-compatible chat completion with interleaved frames.
+
+    On an HTTP error the response body is extracted and truncated into the
+    raised ``RuntimeError`` so launcher logs show *why* vLLM rejected a request
+    (a bare ``raise_for_status`` would hide the server's message).
+    """
+    content = build_chat_content(user_text, images, max_edge=max_edge, quality=quality)
+    payload = {
+        "model": model_id,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ],
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+    }
+    headers = {"Content-Type": "application/json"}
+    headers.update(get_api_headers())
+    resp = requests.post(f"{base_url}/v1/chat/completions", json=payload, headers=headers, timeout=timeout_s)
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        body = (resp.text or "")[:2000]
+        raise RuntimeError(f"vLLM HTTP {resp.status_code}: {body}") from exc
+    data = resp.json()
+    return data["choices"][0]["message"]["content"] or ""
+
+
+def start_vllm_server(
+    args: "argparse.Namespace",
+    *,
+    image_limit: int,
+    cuda_visible_default: str = "0",
+) -> "subprocess.Popen[str]":
+    """Spawn a ``vllm serve`` subprocess from a launcher's parsed args.
+
+    The pure command/env construction lives in :func:`build_vllm_serve_command`;
+    this wrapper only performs the side-effecting spawn and log-stream wiring so
+    the four launchers share one definition. The two genuinely per-caller knobs
+    (*image_limit*, *cuda_visible_default*) stay explicit at the call site.
+    """
+    cmd, _env = build_vllm_serve_command(args, image_limit=image_limit, cuda_visible_default=cuda_visible_default)
+    server_stdout, server_stderr = open_server_log_streams(getattr(args, "server_log", None))
+    # Note: matches the launchers' historical behavior of NOT passing env= to
+    # Popen. build_vllm_serve_command's env is consumed there (to resolve the
+    # vllm binary on PATH); the child inherits the parent environment.
+    return subprocess.Popen(cmd, stdout=server_stdout, stderr=server_stderr, text=True)
