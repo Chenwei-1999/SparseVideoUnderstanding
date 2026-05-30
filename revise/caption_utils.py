@@ -36,7 +36,8 @@ def load_video_captions(captions_dir: str | None, video_id: str) -> dict[int, st
         _CAPTION_CACHE[cache_key] = {}
         return {}
     try:
-        raw = json.loads(open(path, "r", encoding="utf-8").read())
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.loads(f.read())
     except Exception:
         _CAPTION_CACHE[cache_key] = {}
         return {}
