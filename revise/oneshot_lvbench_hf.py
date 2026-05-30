@@ -19,9 +19,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from revise import pnp_harness
+from revise.pnp_protocols import LoopConfig, RunStats
 from revise.pnp_utils import (
     OPTION_LABELS as _ANSWER_LETTERS,
-    apply_processor_chat_template,
     collapse_ws as _collapse_ws,
     configure_llava_processor,
     ensure_writable_hf_cache,
@@ -29,7 +30,6 @@ from revise.pnp_utils import (
     extract_video_info as _extract_video_info,
     format_question_block as _format_question_block,
     maybe_init_wandb as _maybe_init_wandb,
-    maybe_log_jsonl as _maybe_log_jsonl,
     parse_options_from_lvbench_question as _parse_options_from_lvbench_question,
     parse_time_reference_range as _parse_time_reference_range,
     sample_uniform_indices_inclusive as _sample_uniform_indices_inclusive,
@@ -38,6 +38,7 @@ from revise.pnp_utils import (
     timeline_len_1fps as _timeline_len_1fps,
     wandb_log as _wandb_log,
 )
+from revise.plug_and_play_lvbench_hf import HFInProcessBackend
 
 ensure_writable_hf_cache(REPO_ROOT / "data" / "revise_assets" / "hf_home")
 
@@ -180,6 +181,80 @@ def _load_model_and_processor(model_path: str, dtype: str, device: torch.device)
     return model, processor
 
 
+class OneshotLVBenchHFDataset:
+    """Single-round (one-shot) LVBench adapter for the shared PnP engine.
+
+    Only the methods exercised by :func:`revise.pnp_engine.run_sample_oneshot`
+    are implemented: ``frame_count`` / ``format_question`` /
+    ``initial_frame_indices`` / ``extract_frames`` / ``oneshot_user_text`` /
+    ``normalize_answer`` / ``is_correct`` / ``video_path``. Frame probing and
+    extraction go through this module's bare-name helpers so they share the same
+    patch surface as the legacy standalone loop.
+    """
+
+    def __init__(self, *, split: str, video_cache_dir: str) -> None:
+        self.split = split
+        self.video_cache_dir = video_cache_dir
+
+    def _cache_path(self, sample: MCVideoSample) -> Path:
+        return Path(self.video_cache_dir) / sample.dataset / sample.video_key
+
+    def video_path(self, sample: MCVideoSample) -> str:
+        return str(self._cache_path(sample))
+
+    def frame_count(self, sample: MCVideoSample) -> int:
+        total_frames, fps = _extract_video_info(self.video_path(sample))
+        return _timeline_len_1fps(total_frames, fps)
+
+    def num_choices(self, sample: MCVideoSample) -> int:
+        return len(sample.options)
+
+    def normalize_answer(self, sample: MCVideoSample, answer_text: str) -> Optional[str]:
+        return _normalize_answer_letter(answer_text, self.num_choices(sample))
+
+    def ground_truth_letter(self, sample: MCVideoSample) -> Optional[str]:
+        return _normalize_answer_letter(sample.answer_letter, self.num_choices(sample))
+
+    def is_correct(self, sample: MCVideoSample, pred_letter: str) -> bool:
+        gt = self.ground_truth_letter(sample)
+        return bool(pred_letter and gt and pred_letter == gt)
+
+    def format_question(self, sample: MCVideoSample) -> str:
+        return _format_question_block(sample.question, sample.options)
+
+    def _active_range(self, sample: MCVideoSample, frame_count: int) -> tuple[int, int]:
+        if sample.time_reference:
+            parsed = _parse_time_reference_range(sample.time_reference, frame_count)
+            if parsed is not None:
+                return parsed
+        return 0, max(0, int(frame_count) - 1)
+
+    def initial_frame_indices(self, sample: MCVideoSample, frame_count: int, cfg: LoopConfig) -> list[int]:
+        start, end = self._active_range(sample, frame_count)
+        return _sample_uniform_indices_inclusive(start, end, int(cfg.max_frames_per_round))
+
+    def extract_frames(self, sample: MCVideoSample, indices: list[int]) -> list[Any]:
+        return _extract_frames_1fps(self.video_path(sample), indices)
+
+    def oneshot_user_text(
+        self,
+        question_block: str,
+        num_frames: int,
+        *,
+        frame_indices: Optional[list[int]] = None,
+    ) -> str:
+        # Bare prompt text WITHOUT per-frame <image> placeholders: the HF backend
+        # (`_chat_once_hf`) prepends one image placeholder per frame, reproducing
+        # the legacy images-first conversation layout. Kept byte-identical to the
+        # legacy standalone ``prompt_text``.
+        _ = num_frames, frame_indices
+        return (
+            f"{question_block}\n\n"
+            "You will be given video frames sampled at 1 fps.\n"
+            "Answer with EXACTLY ONE option letter (e.g., A/B/C/D). Do not output any other text."
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="train")
@@ -212,6 +287,7 @@ def main() -> None:
 
     args = ap.parse_args()
 
+    split = args.split
     samples = _load_lvbench_samples(args.split)
 
     start_idx = max(0, int(args.start_idx or 0))
@@ -280,328 +356,174 @@ def main() -> None:
     run = _maybe_init_wandb(args, run_config)
 
     rng = random.Random(42 + int(args.shard_idx))
-    start_t = time.time()
 
-    processed = 0
-    correct = 0
-    failed = 0
-    invalid_outputs = 0
-    invalid_action_terminated = 0
-    total_model_calls = 0
-    total_retries = 0
-    total_frames_used = 0
+    # Pre-create the per-dataset cache dir so the existence-skip path matches the
+    # legacy behavior (the legacy loop mkdir'd it per sample).
+    cache_dir = Path(args.video_cache_dir) / "lvbench"
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
-    for sample in samples:
-        processed += 1
+    # Build the shared single-round (one-shot) Dataset adapter + the HF in-process
+    # backend, then delegate the eval loop to the shared harness
+    # (setting="oneshot_baseline"). The adapter reuses this module's bare-name
+    # frame helpers; the harness owns the video-existence skip (never downloads),
+    # scoring, logging, and this launcher's own summary schema.
+    #
+    # Behavioral deltas vs. the legacy standalone loop (consistent with the
+    # multi-round HF migration): no yt-dlp download / `.failed` markers, no 3x
+    # inference retry, and no prompt-length truncation. Samples whose video is
+    # absent are counted as failed (existence skip); model errors propagate.
+    dataset_adapter = OneshotLVBenchHFDataset(split=split, video_cache_dir=args.video_cache_dir)
+    backend = HFInProcessBackend(model=model, processor=processor, device=device, max_len=max_len)
+    cfg = LoopConfig(
+        max_rounds=1,
+        max_frames_per_round=int(args.max_frames),
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=int(args.max_new_tokens),
+        request_timeout_s=0,
+        max_retries_per_round=0,
+        strict_actions=False,
+        force_final_answer=False,
+        use_candidate_frames=False,
+        candidate_k=None,
+        use_candidate_frame_ids=False,
+        require_candidate_frames=False,
+        answer_only_final_round=False,
+        observation_mode="image",
+        caption_include="none",
+        caption_max_chars=0,
+        captions_dir=None,
+        hide_seen_frames_in_prompt=False,
+        log_jsonl=args.log_jsonl or None,
+        seed=42 + int(args.shard_idx),
+    )
 
-        cache_dir = Path(args.video_cache_dir) / sample.dataset
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        video_path = str(cache_dir / sample.video_key)
-        failed_marker = video_path + ".failed"
+    def _video_path(sample: MCVideoSample) -> str:
+        return str(cache_dir / sample.video_key)
 
-        video_ok = os.path.exists(video_path) and os.path.getsize(video_path) > 0
-        if video_ok and os.path.exists(failed_marker):
-            try:
-                os.remove(failed_marker)
-            except Exception:
-                pass
-
-        if not video_ok and os.path.exists(failed_marker):
-            failed += 1
-            _maybe_log_jsonl(
-                args.log_jsonl,
-                {
-                    "ts": time.time(),
-                    "dataset": sample.dataset,
-                    "split": args.split,
-                    "sample_id": sample.sample_id,
-                    "uid": sample.uid,
-                    "video_key": sample.video_key,
-                    "video_url": sample.video_url,
-                    "error": "download_failed_cached",
-                },
-            )
-            continue
-
-        if not video_ok:
-            try:
-                _download_youtube(sample.video_url, video_path, py_bin=sys.executable, timeout_s=args.yt_dlp_timeout_s)
-            except Exception as e:
-                failed += 1
-                try:
-                    with open(failed_marker, "w", encoding="utf-8") as f:
-                        f.write(f"download_failed: {type(e).__name__}: {str(e)}\n")
-                except Exception:
-                    pass
-                _maybe_log_jsonl(
-                    args.log_jsonl,
-                    {
-                        "ts": time.time(),
-                        "dataset": sample.dataset,
-                        "split": args.split,
-                        "sample_id": sample.sample_id,
-                        "uid": sample.uid,
-                        "video_key": sample.video_key,
-                        "video_url": sample.video_url,
-                        "error": f"download_failed: {type(e).__name__}: {str(e)[:400]}",
-                    },
-                )
-                continue
-
-        try:
-            total_frames, fps = _extract_video_info(video_path)
-            timeline_len = _timeline_len_1fps(total_frames, fps)
-        except Exception as e:
-            failed += 1
-            _maybe_log_jsonl(
-                args.log_jsonl,
-                {
-                    "ts": time.time(),
-                    "dataset": sample.dataset,
-                    "split": args.split,
-                    "sample_id": sample.sample_id,
-                    "uid": sample.uid,
-                    "video_key": sample.video_key,
-                    "video_path": video_path,
-                    "error": f"video_probe_failed: {type(e).__name__}: {str(e)[:400]}",
-                },
-            )
-            continue
-
-        if timeline_len <= 0:
-            failed += 1
-            continue
-
-        time_range = None
-        if sample.time_reference:
-            time_range = _parse_time_reference_range(sample.time_reference, timeline_len)
-        if time_range is None:
-            range_start, range_end = 0, timeline_len - 1
-        else:
-            range_start, range_end = time_range
-
-        frame_indices = _sample_uniform_indices_inclusive(range_start, range_end, int(args.max_frames))
-        frames = _extract_frames_1fps(video_path, frame_indices)
-        if not frames:
-            failed += 1
-            continue
-
-        # Build structured conversation required by LlavaOnevisionProcessor.
-        q_block = _format_question_block(sample.question, sample.options)
-        prompt_text = (
-            f"{q_block}\n\n"
-            "You will be given video frames sampled at 1 fps.\n"
-            "Answer with EXACTLY ONE option letter (e.g., A/B/C/D). Do not output any other text."
-        )
-        content: list[dict[str, Any]] = [{"type": "image"} for _ in frames]
-        content.append({"type": "text", "text": prompt_text})
-        conv = [{"role": "user", "content": content}]
-        chat = apply_processor_chat_template(processor, conv, tokenize=False, add_generation_prompt=True)
-
-        # Ensure input length + generation does not exceed model max length.
-        # Llava-OneVision expands each image into many tokens; some videos can exceed max_len even with few frames.
-        max_new = int(args.max_new_tokens)
-        usable_frames = frames
-        input_len = 0
-        inputs: dict[str, Any] = {}
-        while True:
-            inputs = processor(text=chat, images=usable_frames, return_tensors="pt")
-            input_len = int(inputs["input_ids"].shape[-1])
-            if input_len + max_new <= max_len:
-                break
-            if len(usable_frames) <= 1:
-                break
-            usable_frames = usable_frames[:-1]
-            content = [{"type": "image"} for _ in usable_frames] + [{"type": "text", "text": prompt_text}]
-            conv = [{"role": "user", "content": content}]
-            chat = apply_processor_chat_template(processor, conv, tokenize=False, add_generation_prompt=True)
-
-        if input_len + max_new > max_len:
-            failed += 1
-            _maybe_log_jsonl(
-                args.log_jsonl,
-                {
-                    "ts": time.time(),
-                    "dataset": sample.dataset,
-                    "split": args.split,
-                    "sample_id": sample.sample_id,
-                    "uid": sample.uid,
-                    "video_key": sample.video_key,
-                    "video_path": video_path,
-                    "timeline_len": timeline_len,
-                    "time_reference": sample.time_reference,
-                    "sampled_frames": len(frames),
-                    "usable_frames": len(usable_frames),
-                    "input_len": input_len,
-                    "error": f"prompt_too_long: input_len={input_len} max_len={max_len} max_new={max_new}",
-                },
-            )
-            continue
-
-        total_frames_used += len(usable_frames)
-        inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
-        pred_text = ""
-        for retry_idx in range(3):
-            try:
-                with torch.inference_mode():
-                    generated = model.generate(
-                        **inputs,
-                        max_new_tokens=max_new,
-                        do_sample=False,
-                    )
-                total_model_calls += 1
-                gen_ids = generated[:, inputs["input_ids"].shape[-1] :]
-                pred_text = processor.batch_decode(gen_ids, skip_special_tokens=True)[0]
-                break
-            except Exception as e:
-                total_retries += 1
-                if retry_idx >= 2:
-                    failed += 1
-                    _maybe_log_jsonl(
-                        args.log_jsonl,
-                        {
-                            "ts": time.time(),
-                            "dataset": sample.dataset,
-                            "split": args.split,
-                            "sample_id": sample.sample_id,
-                            "uid": sample.uid,
-                            "video_key": sample.video_key,
-                            "video_path": video_path,
-                            "input_len": input_len,
-                            "error": f"infer_failed: {type(e).__name__}: {str(e)[:400]}",
-                        },
-                    )
-                    pred_text = ""
-                else:
-                    time.sleep(0.2 + 0.2 * rng.random())
-
-        pred = _normalize_answer_letter(pred_text, len(sample.options))
+    def _log_record(
+        sample: MCVideoSample,
+        *,
+        outcome: Any,
+        pred: Optional[str],
+        is_correct: bool,
+        video_path: str,
+        split: str,
+    ) -> dict[str, Any]:
         gt = _normalize_answer_letter(sample.answer_letter, len(sample.options))
-        is_correct = bool(pred and gt and pred == gt)
-        if pred is None:
-            invalid_outputs += 1
-            invalid_action_terminated += 1
-        if is_correct:
-            correct += 1
-
-        _maybe_log_jsonl(
-            args.log_jsonl,
-            {
-                "ts": time.time(),
-                "dataset": sample.dataset,
-                "split": args.split,
-                "sample_id": sample.sample_id,
-                "uid": sample.uid,
-                "video_key": sample.video_key,
-                "video_url": sample.video_url,
-                "video_path": video_path,
-                "timeline_len": timeline_len,
-                "time_reference": sample.time_reference,
-                "sampled_frames": len(frames),
-                "usable_frames": len(usable_frames),
-                "frame_indices": frame_indices[: len(usable_frames)],
-                "input_len": input_len,
-                "question": sample.question,
-                "options": sample.options,
-                "answer_gt": gt,
-                "pred_answer": pred,
-                "pred_text": pred_text[:200],
-                "is_correct": is_correct,
-            },
-        )
-
-        if processed % 20 == 0:
-            acc = correct / max(1, processed)
-            print(
-                f"[{processed}/{len(samples)}] acc={acc:.4f} failed={failed} invalid={invalid_outputs} "
-                f"calls={total_model_calls} elapsed_s={time.time()-start_t:.1f}",
-                flush=True,
-            )
-            _wandb_log(
-                run,
-                {
-                    "eval/acc": acc,
-                    "eval/failed": failed,
-                    "eval/invalid_outputs": invalid_outputs,
-                    "eval/total_calls": total_model_calls,
-                },
-                step=processed,
-            )
-
-    elapsed = time.time() - start_t
-    acc = correct / max(1, processed)
-    total_rounds = max(0, processed - failed)
-    avg_rounds = total_rounds / max(1, processed)
-    total_effective_rounds = total_rounds
-    avg_effective_rounds = avg_rounds
-    avg_frames_used = total_frames_used / max(1, processed)
-    prompt_log_lines = 0
-    prompt_log_bytes = 0
-    if args.log_jsonl and os.path.exists(args.log_jsonl):
-        prompt_log_bytes = os.path.getsize(args.log_jsonl)
-        with open(args.log_jsonl, "r", encoding="utf-8") as f:
-            prompt_log_lines = sum(1 for _ in f)
-
-    results = {
-        "samples": processed,
-        "correct": correct,
-        "accuracy": acc,
-        "total_rounds": total_rounds,
-        "avg_rounds": avg_rounds,
-        "total_effective_rounds": total_effective_rounds,
-        "avg_effective_rounds": avg_effective_rounds,
-        "total_frames_used": total_frames_used,
-        "avg_frames_used": avg_frames_used,
-        "failed": failed,
-        "elapsed_s": elapsed,
-        "prompt_log_lines": prompt_log_lines,
-        "prompt_log_bytes": prompt_log_bytes,
-        "invalid_outputs": invalid_outputs,
-        "invalid_action_terminated": invalid_action_terminated,
-        "total_retries": total_retries,
-        "total_model_calls": total_model_calls,
-    }
-    print(json.dumps(results, indent=2), flush=True)
-
-    wandb_info: Optional[dict[str, Any]] = None
-    if run is not None:
-        run.summary["final_acc"] = acc
-        run.summary["failed"] = failed
-        run.summary["invalid_outputs"] = invalid_outputs
-        run.summary["prompt_log_jsonl"] = args.log_jsonl
-        run.summary["prompt_log_lines"] = prompt_log_lines
-        run.summary["prompt_log_bytes"] = prompt_log_bytes
-        run.finish()
-        wandb_info = {
-            "enabled": True,
-            "mode": getattr(args, "wandb_mode", "") or os.getenv("WANDB_MODE"),
-            "id": getattr(run, "id", None),
-            "url": getattr(run, "url", None),
+        return {
+            "ts": time.time(),
+            "dataset": sample.dataset,
+            "split": split,
+            "sample_id": sample.sample_id,
+            "uid": sample.uid,
+            "video_key": sample.video_key,
+            "video_url": sample.video_url,
+            "video_path": video_path,
+            "time_reference": sample.time_reference,
+            "frame_indices": list(outcome.frame_indices),
+            "question": sample.question,
+            "options": sample.options,
+            "answer_gt": gt,
+            "pred_answer": pred,
+            "raw_output": outcome.raw_output,
+            "is_correct": bool(is_correct),
         }
 
-    summary = {
-        "task": "lvbench_oneshot_hf",
-        "dataset": "lvbench",
-        "split": args.split,
-        "model_path": args.model_path,
-        "video_cache_dir": args.video_cache_dir,
-        "dtype": args.dtype,
-        "max_frames": args.max_frames,
-        "max_new_tokens": args.max_new_tokens,
-        "num_shards": args.num_shards,
-        "shard_idx": args.shard_idx,
-        "log_jsonl": args.log_jsonl,
-        "summary_json": args.summary_json,
-        "prompt_log_jsonl": args.log_jsonl,
-        "results": results,
-        "wandb": wandb_info,
-        "command": " ".join(sys.argv),
-    }
+    def _build_summary(
+        *,
+        samples_total: int,
+        answered: int,
+        correct: int,
+        failed: int,
+        invalid: int,
+        frames_used: int,
+        elapsed_s: float,
+        stats: RunStats,
+    ) -> dict[str, Any]:
+        processed = samples_total
+        total_rounds = max(0, processed - failed)
+        prompt_log_lines = 0
+        prompt_log_bytes = 0
+        if args.log_jsonl and os.path.exists(args.log_jsonl):
+            prompt_log_bytes = os.path.getsize(args.log_jsonl)
+            with open(args.log_jsonl, "r", encoding="utf-8") as f:
+                prompt_log_lines = sum(1 for _ in f)
+        results = {
+            "samples": processed,
+            "correct": correct,
+            "accuracy": correct / max(1, processed),
+            "total_rounds": total_rounds,
+            "avg_rounds": total_rounds / max(1, processed),
+            "total_effective_rounds": total_rounds,
+            "avg_effective_rounds": total_rounds / max(1, processed),
+            "total_frames_used": frames_used,
+            "avg_frames_used": frames_used / max(1, processed),
+            "failed": failed,
+            "elapsed_s": float(elapsed_s),
+            "prompt_log_lines": prompt_log_lines,
+            "prompt_log_bytes": prompt_log_bytes,
+            "invalid_outputs": invalid,
+            "invalid_action_terminated": invalid,
+            "total_retries": 0,
+            "total_model_calls": stats.total_model_calls,
+        }
+        wandb_info: Optional[dict[str, Any]] = None
+        if run is not None:
+            run.summary["final_acc"] = results["accuracy"]
+            run.summary["failed"] = failed
+            run.summary["invalid_outputs"] = invalid
+            run.summary["prompt_log_jsonl"] = args.log_jsonl
+            run.summary["prompt_log_lines"] = prompt_log_lines
+            run.summary["prompt_log_bytes"] = prompt_log_bytes
+            run.finish()
+            wandb_info = {
+                "enabled": True,
+                "mode": getattr(args, "wandb_mode", "") or os.getenv("WANDB_MODE"),
+                "id": getattr(run, "id", None),
+                "url": getattr(run, "url", None),
+            }
+        return {
+            "task": "lvbench_oneshot_hf",
+            "dataset": "lvbench",
+            "split": args.split,
+            "model_path": args.model_path,
+            "video_cache_dir": args.video_cache_dir,
+            "dtype": args.dtype,
+            "max_frames": args.max_frames,
+            "max_new_tokens": args.max_new_tokens,
+            "num_shards": args.num_shards,
+            "shard_idx": args.shard_idx,
+            "log_jsonl": args.log_jsonl,
+            "summary_json": args.summary_json,
+            "prompt_log_jsonl": args.log_jsonl,
+            "results": results,
+            "wandb": wandb_info,
+            "command": " ".join(sys.argv),
+        }
 
-    if args.summary_json:
-        Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
-        with open(args.summary_json, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, ensure_ascii=False)
+    args._pnp_setting = "oneshot_baseline"
+    args._pnp_split = split
+    args._pnp_oneshot_resume_completed = resume_completed
+    args._pnp_oneshot_skip_missing_video = True
+    args._pnp_oneshot_video_path = _video_path
+    args._pnp_oneshot_log_record = _log_record
+    args._pnp_oneshot_build_summary = _build_summary
+    args._pnp_oneshot_restart_server = None
+
+    stats = RunStats()
+    pnp_harness.run_eval(
+        samples,
+        dataset=dataset_adapter,
+        backend=backend,
+        cfg=cfg,
+        stats=stats,
+        rng=rng,
+        base_url="",
+        model_id=backend.get_model_id("", model_id=args.model_path),
+        run=None,
+        args=args,
+    )
 
 
 if __name__ == "__main__":

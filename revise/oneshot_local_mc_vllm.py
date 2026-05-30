@@ -16,19 +16,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from revise import pnp_harness
 from revise.plug_and_play_egoschema_vllm import _load_egoschema_samples
 from revise.plug_and_play_nextqa_vllm import (
     _chat_once,
     _load_nextqa_samples,
     _start_vllm_server,
 )
+from revise.pnp_protocols import LoopConfig, RunStats
 from revise.pnp_utils import (
     extract_frames,
     extract_video_info,
     format_question_block,
     format_videoespresso_question_block,
     get_model_id,
-    maybe_log_jsonl,
     normalize_answer_letter,
     pick_free_port,
     resolve_base_url,
@@ -49,6 +50,96 @@ def _build_user_text(question_block: str, frame_indices: list[int]) -> str:
     for idx in frame_indices:
         lines.append(f"Frame {idx}: <image>")
     return "\n".join(lines)
+
+
+class LocalMCDataset:
+    """Single-round (one-shot) adapter for local multiple-choice datasets.
+
+    Wraps the NExT-QA / jsonmc (EgoSchema-style) loaders and exposes only the
+    methods exercised by :func:`revise.pnp_engine.run_sample_oneshot`. Frame
+    probing/extraction and chat go through this module's bare-name helpers so
+    the patch surface matches the legacy standalone loop.
+
+    The one-shot prompt enumerates frames by their *actual* sampled timeline
+    index (``Frame {idx}: <image>``), so :meth:`oneshot_user_text` consumes the
+    ``frame_indices`` the engine threads through.
+    """
+
+    def __init__(
+        self,
+        *,
+        dataset_name: str,
+        videoespresso_use_official_prompt: bool,
+        videoespresso_with_evidence: bool,
+    ) -> None:
+        self.dataset_name = str(dataset_name).strip().lower()
+        self.videoespresso_use_official_prompt = bool(videoespresso_use_official_prompt)
+        self.videoespresso_with_evidence = bool(videoespresso_with_evidence)
+
+    def video_path(self, sample: Any) -> str:
+        return sample.video_path
+
+    def frame_count(self, sample: Any) -> int:
+        # Legacy parity: probe the video for its frame count; the engine then
+        # uniformly samples within it. A 0-frame probe is treated as an empty
+        # timeline by the engine (counted as failed).
+        frame_count, _ = extract_video_info(sample.video_path)
+        return int(frame_count or 0)
+
+    def num_choices(self, sample: Any) -> int:
+        return len(sample.choices)
+
+    def normalize_answer(self, sample: Any, answer_text: str) -> Optional[str]:
+        return normalize_answer_letter(answer_text, self.num_choices(sample))
+
+    def ground_truth_letter(self, sample: Any) -> Optional[str]:
+        return normalize_answer_letter(chr(ord("A") + int(sample.answer_idx)), self.num_choices(sample))
+
+    def is_correct(self, sample: Any, pred_letter: str) -> bool:
+        gt = self.ground_truth_letter(sample)
+        return bool(pred_letter and gt and pred_letter == gt)
+
+    def format_question(self, sample: Any) -> str:
+        if self.dataset_name == "videoespresso" and self.videoespresso_use_official_prompt:
+            return format_videoespresso_question_block(
+                sample.question,
+                sample.choices,
+                task=getattr(sample, "task", ""),
+                evidence=getattr(sample, "evidence", ""),
+                with_evidence=bool(self.videoespresso_with_evidence),
+                revise_answer_tags=False,
+            )
+        return format_question_block(sample.question, sample.choices)
+
+    def initial_frame_indices(self, sample: Any, frame_count: int, cfg: LoopConfig) -> list[int]:
+        _ = sample
+        return sample_uniform_indices(int(frame_count or 0), int(cfg.max_frames_per_round))
+
+    def extract_frames(self, sample: Any, indices: list[int]) -> list[Any]:
+        return extract_frames(sample.video_path, indices)
+
+    def oneshot_user_text(
+        self,
+        question_block: str,
+        num_frames: int,
+        *,
+        frame_indices: Optional[list[int]] = None,
+    ) -> str:
+        _ = num_frames
+        return _build_user_text(question_block, list(frame_indices or []))
+
+
+class _LocalMCBackend:
+    """vLLM HTTP backend that routes through this module's bare-name ``_chat_once``.
+
+    Mirrors the legacy standalone call so the same chat seam is patched in tests.
+    """
+
+    def chat(self, **kwargs: Any) -> str:
+        return _chat_once(**kwargs)
+
+    def get_model_id(self, base_url: str, model_id: Optional[str] = None) -> str:
+        return get_model_id(base_url, model_id=model_id)
 
 
 def _slice_samples(samples: list[Any], start_idx: int, end_idx: int, max_samples: int) -> list[Any]:
@@ -184,158 +275,169 @@ def main() -> int:
     base_url = resolve_base_url(args.base_url, args.host, args.port)
     model_id = get_model_id(base_url, model_id=args.model_id)
 
-    correct = 0
-    failed = 0
-    total_calls = 0
-    total_frames = 0
-    start_t = time.time()
+    num_samples = len(samples)
     system_prompt = ""
 
-    for i, sample in enumerate(samples, start=1):
-        frame_indices: list[int] = []
-        raw_output = ""
-        user_text = ""
-        if dataset_name == "videoespresso" and args.videoespresso_use_official_prompt:
-            question_block = format_videoespresso_question_block(
-                sample.question,
-                sample.choices,
-                task=getattr(sample, "task", ""),
-                evidence=getattr(sample, "evidence", ""),
-                with_evidence=bool(args.videoespresso_with_evidence),
-                revise_answer_tags=False,
-            )
-        else:
-            question_block = format_question_block(sample.question, sample.choices)
+    # Build the shared single-round (one-shot) Dataset adapter + the vLLM HTTP
+    # backend, then delegate the eval loop to the shared harness
+    # (setting="oneshot_baseline"). The adapter reuses this module's bare-name
+    # frame/chat helpers; the harness owns scoring, logging, and this launcher's
+    # own summary schema.
+    #
+    # Behavioral deltas vs. the legacy standalone loop (consistent with the
+    # other one-shot migrations): video probing/extraction failures are counted
+    # as failed by the engine (instead of being inline-skipped) and the engine
+    # owns the single chat per sample. Missing videos are NOT pre-skipped here
+    # (skip_missing=False) so extraction drives the failure exactly as before.
+    dataset_adapter = LocalMCDataset(
+        dataset_name=dataset_name,
+        videoespresso_use_official_prompt=bool(args.videoespresso_use_official_prompt),
+        videoespresso_with_evidence=bool(args.videoespresso_with_evidence),
+    )
+    backend = _LocalMCBackend()
+    cfg = LoopConfig(
+        max_rounds=1,
+        max_frames_per_round=int(args.max_frames),
+        temperature=float(args.temperature),
+        top_p=float(args.top_p),
+        max_tokens=int(args.max_tokens),
+        request_timeout_s=int(args.timeout_s),
+        max_retries_per_round=0,
+        strict_actions=False,
+        force_final_answer=False,
+        use_candidate_frames=False,
+        candidate_k=None,
+        use_candidate_frame_ids=False,
+        require_candidate_frames=False,
+        answer_only_final_round=False,
+        observation_mode="image",
+        caption_include="none",
+        caption_max_chars=0,
+        captions_dir=None,
+        hide_seen_frames_in_prompt=False,
+        log_jsonl=args.log_jsonl or None,
+        seed=args.seed,
+    )
+
+    is_videoespresso_official = bool(
+        dataset_name == "videoespresso" and args.videoespresso_use_official_prompt
+    )
+    is_videoespresso_evidence = bool(
+        dataset_name == "videoespresso" and args.videoespresso_with_evidence
+    )
+
+    def _restart_server() -> Optional[str]:
+        nonlocal server_proc, model_id
+        if not (args.restart_server_on_failure and args.start_server and server_proc is not None):
+            raise RuntimeError("restart_not_configured")
         try:
-            frame_count, _ = extract_video_info(sample.video_path)
-            frame_indices = sample_uniform_indices(int(frame_count or 0), int(args.max_frames))
-            images = extract_frames(sample.video_path, frame_indices)
-            if not images:
-                raise RuntimeError("no frames extracted")
-            user_text = _build_user_text(question_block, frame_indices)
-            raw_output = _chat_once(
-                base_url=base_url,
-                model_id=model_id,
-                system_prompt=system_prompt,
-                user_text=user_text,
-                images=images,
-                temperature=float(args.temperature),
-                top_p=float(args.top_p),
-                max_tokens=int(args.max_tokens),
-                timeout_s=int(args.timeout_s),
-            )
-            total_calls += 1
-        except Exception as e:
-            if args.restart_server_on_failure and args.start_server and server_proc is not None:
-                try:
-                    stop_server(server_proc)
-                except Exception:
-                    pass
-                server_proc = _start_vllm_server(args)
-                wait_port(args.host, args.port, timeout_s=args.server_timeout_s)
-                wait_for_server(args.host, args.port, timeout_s=args.server_timeout_s)
-                model_id = get_model_id(base_url, model_id=args.model_id)
-                try:
-                    frame_count, _ = extract_video_info(sample.video_path)
-                    frame_indices = sample_uniform_indices(int(frame_count or 0), int(args.max_frames))
-                    images = extract_frames(sample.video_path, frame_indices)
-                    if not images:
-                        raise RuntimeError("no frames extracted")
-                    user_text = _build_user_text(question_block, frame_indices)
-                    raw_output = _chat_once(
-                        base_url=base_url,
-                        model_id=model_id,
-                        system_prompt=system_prompt,
-                        user_text=user_text,
-                        images=images,
-                        temperature=float(args.temperature),
-                        top_p=float(args.top_p),
-                        max_tokens=int(args.max_tokens),
-                        timeout_s=int(args.timeout_s),
-                    )
-                    total_calls += 1
-                except Exception:
-                    failed += 1
-                    continue
-            else:
-                failed += 1
-                maybe_log_jsonl(
-                    args.log_jsonl,
-                    {
-                        "ts": time.time(),
-                        "dataset": dataset_name,
-                        "sample_id": sample.sample_id,
-                        "qid": getattr(sample, "qid", ""),
-                        "video_path": sample.video_path,
-                        "question": sample.question,
-                        "options": sample.choices,
-                        "task": getattr(sample, "task", ""),
-                        "evidence": getattr(sample, "evidence", ""),
-                        "system_prompt": system_prompt,
-                        "user_text": user_text,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_text},
-                        ],
-                        "frame_indices": frame_indices,
-                        "videoespresso_official_prompt": bool(
-                            dataset_name == "videoespresso" and args.videoespresso_use_official_prompt
-                        ),
-                        "videoespresso_with_evidence": bool(
-                            dataset_name == "videoespresso" and args.videoespresso_with_evidence
-                        ),
-                        "error": f"{type(e).__name__}: {e}",
-                    },
-                )
-                continue
+            stop_server(server_proc)
+        except Exception:
+            pass
+        server_proc = _start_vllm_server(args)
+        wait_port(args.host, args.port, timeout_s=args.server_timeout_s)
+        wait_for_server(args.host, args.port, timeout_s=args.server_timeout_s)
+        model_id = get_model_id(base_url, model_id=args.model_id)
+        return model_id
 
-        pred = normalize_answer_letter(raw_output, len(sample.choices))
+    restart_enabled = bool(args.restart_server_on_failure and args.start_server)
+
+    def _log_record(
+        sample: Any,
+        *,
+        outcome: Any,
+        pred: Optional[str],
+        is_correct: bool,
+        video_path: str,
+        split: str,
+    ) -> dict[str, Any]:
+        _ = split
+        frame_indices = list(outcome.frame_indices)
+        question_block = dataset_adapter.format_question(sample)
+        user_text = _build_user_text(question_block, frame_indices)
         gt = normalize_answer_letter(chr(ord("A") + int(sample.answer_idx)), len(sample.choices))
-        is_correct = pred is not None and gt is not None and pred == gt
-        if is_correct:
-            correct += 1
-        total_frames += len(frame_indices)
+        raw_output = outcome.raw_output
+        return {
+            "ts": time.time(),
+            "dataset": dataset_name,
+            "sample_id": sample.sample_id,
+            "qid": getattr(sample, "qid", ""),
+            "video_path": sample.video_path,
+            "question": sample.question,
+            "options": sample.choices,
+            "task": getattr(sample, "task", ""),
+            "evidence": getattr(sample, "evidence", ""),
+            "system_prompt": system_prompt,
+            "user_text": user_text,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": raw_output},
+            ],
+            "frame_indices": frame_indices,
+            "pred_answer": pred,
+            "answer_gt": gt,
+            "correct": bool(is_correct),
+            "raw_output": raw_output,
+            "videoespresso_official_prompt": is_videoespresso_official,
+            "videoespresso_with_evidence": is_videoespresso_evidence,
+        }
 
-        maybe_log_jsonl(
-            args.log_jsonl,
-            {
-                "ts": time.time(),
-                "dataset": dataset_name,
-                "sample_id": sample.sample_id,
-                "qid": getattr(sample, "qid", ""),
-                "video_path": sample.video_path,
-                "question": sample.question,
-                "options": sample.choices,
-                "task": getattr(sample, "task", ""),
-                "evidence": getattr(sample, "evidence", ""),
-                "system_prompt": system_prompt,
-                "user_text": user_text,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text},
-                    {"role": "assistant", "content": raw_output},
-                ],
-                "frame_indices": frame_indices,
-                "pred_answer": pred,
-                "answer_gt": gt,
-                "correct": bool(is_correct),
-                "raw_output": raw_output,
-                "videoespresso_official_prompt": bool(
-                    dataset_name == "videoespresso" and args.videoespresso_use_official_prompt
-                ),
-                "videoespresso_with_evidence": bool(
-                    dataset_name == "videoespresso" and args.videoespresso_with_evidence
-                ),
-            },
-        )
+    def _build_summary(
+        *,
+        samples_total: int,
+        answered: int,
+        correct: int,
+        failed: int,
+        invalid: int,
+        frames_used: int,
+        elapsed_s: float,
+        stats: RunStats,
+    ) -> dict[str, Any]:
+        _ = invalid
+        return {
+            "task": "oneshot_local_mc_vllm",
+            "dataset": dataset_name,
+            "samples": samples_total,
+            "answered": answered,
+            "correct": correct,
+            "accuracy": float(correct / max(1, answered)),
+            "failed": failed,
+            "avg_frames": float(frames_used / max(1, answered)),
+            "elapsed_s": float(elapsed_s),
+            "total_model_calls": stats.total_model_calls,
+            "log_jsonl": args.log_jsonl,
+            "videoespresso_use_official_prompt": bool(args.videoespresso_use_official_prompt)
+            if dataset_name == "videoespresso"
+            else None,
+            "videoespresso_with_evidence": bool(args.videoespresso_with_evidence)
+            if dataset_name == "videoespresso"
+            else None,
+        }
 
-        if i % 50 == 0:
-            answered = i - failed
-            acc = correct / max(1, answered)
-            print(
-                f"[{i}/{len(samples)}] dataset={dataset_name} acc={acc:.4f} failed={failed} calls={total_calls}",
-                flush=True,
-            )
+    args._pnp_setting = "oneshot_baseline"
+    args._pnp_split = ""
+    args._pnp_oneshot_resume_completed = 0
+    args._pnp_oneshot_skip_missing_video = False
+    args._pnp_oneshot_video_path = lambda sample: sample.video_path
+    args._pnp_oneshot_log_record = _log_record
+    args._pnp_oneshot_build_summary = _build_summary
+    args._pnp_oneshot_restart_server = _restart_server if restart_enabled else None
+
+    stats = RunStats()
+    rng = random.Random(args.seed)
+    results = pnp_harness.run_eval(
+        samples,
+        dataset=dataset_adapter,
+        backend=backend,
+        cfg=cfg,
+        stats=stats,
+        rng=rng,
+        base_url=base_url,
+        model_id=model_id,
+        run=None,
+        args=args,
+    )
 
     if server_proc is not None:
         try:
@@ -343,35 +445,9 @@ def main() -> int:
         except Exception:
             pass
 
-    answered = max(0, len(samples) - failed)
-    summary = {
-        "task": "oneshot_local_mc_vllm",
-        "dataset": dataset_name,
-        "samples": len(samples),
-        "answered": answered,
-        "correct": correct,
-        "accuracy": float(correct / max(1, answered)),
-        "failed": failed,
-        "avg_frames": float(total_frames / max(1, answered)),
-        "elapsed_s": float(time.time() - start_t),
-        "total_model_calls": total_calls,
-        "log_jsonl": args.log_jsonl,
-        "videoespresso_use_official_prompt": bool(args.videoespresso_use_official_prompt)
-        if dataset_name == "videoespresso"
-        else None,
-        "videoespresso_with_evidence": bool(args.videoespresso_with_evidence)
-        if dataset_name == "videoespresso"
-        else None,
-    }
-    payload = json.dumps(summary, ensure_ascii=False, indent=2)
-    print(payload, flush=True)
-    if args.summary_json:
-        out_dir = os.path.dirname(args.summary_json)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        with open(args.summary_json, "w", encoding="utf-8") as f:
-            f.write(payload + "\n")
-    if len(samples) > 0 and (failed >= len(samples) or total_calls == 0):
+    failed = int(results.get("failed", 0))
+    total_calls = int(results.get("total_model_calls", 0))
+    if num_samples > 0 and (failed >= num_samples or total_calls == 0):
         return 2
     return 0
 

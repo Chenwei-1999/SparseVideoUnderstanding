@@ -878,6 +878,7 @@ def _oneshot_default_build_summary(
     answered: int,
     correct: int,
     failed: int,
+    invalid: int,
     frames_used: int,
     elapsed_s: float,
     stats: RunStats,
@@ -886,7 +887,7 @@ def _oneshot_default_build_summary(
 
     Written directly as the summary-json payload (NOT nested under ``results``).
     """
-    _ = frames_used
+    _ = frames_used, invalid
     return {
         "samples": samples_total,
         "answered": answered,
@@ -950,6 +951,7 @@ def _run_oneshot(
     start_t = time.time()
     correct = 0
     failed = 0
+    invalid = 0
     frames_used = 0
     printed_error = False
 
@@ -1009,6 +1011,8 @@ def _run_oneshot(
         is_correct = pred is not None and dataset.is_correct(sample, pred)
         if is_correct:
             correct += 1
+        if pred is None:
+            invalid += 1
         frames_used += len(outcome.frame_indices)
 
         if log_record_fn is not None:
@@ -1051,6 +1055,7 @@ def _run_oneshot(
             answered=answered,
             correct=correct,
             failed=failed,
+            invalid=invalid,
             frames_used=frames_used,
             elapsed_s=elapsed_s,
             stats=stats,
@@ -1062,6 +1067,7 @@ def _run_oneshot(
             answered=answered,
             correct=correct,
             failed=failed,
+            invalid=invalid,
             frames_used=frames_used,
             elapsed_s=elapsed_s,
             stats=stats,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from revise.oneshot_local_mc_vllm import LocalMCDataset
 from revise.plug_and_play_egoschema_vllm import EgoSchemaDataset
 from revise.plug_and_play_lvbench_hf import HFInProcessBackend, LVBenchHFDataset
 from revise.plug_and_play_nextqa_vllm import NextQADataset
@@ -18,6 +19,7 @@ DATASETS: dict[str, type[Any]] = {
     "videomme": VideoMMEDataset,
     "lvbench": LVBenchDataset,
     "lvbench_hf": LVBenchHFDataset,
+    "local_mc": LocalMCDataset,
 }
 
 BACKENDS: dict[str, type[Any]] = {
