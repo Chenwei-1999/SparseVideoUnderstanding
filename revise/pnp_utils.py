@@ -622,6 +622,77 @@ def extract_frames(video_path: str, frame_indices: list[int]) -> list[Image.Imag
         reader.close()
 
 
+class CachedVideoReader:
+    """Open a video once and reuse the decoder for metadata and frame reads.
+
+    The free functions :func:`extract_video_info`, :func:`extract_frames`, and
+    :func:`extract_frames_1fps` each open the video file independently, so a
+    single multi-round pass over one clip pays the decoder-open cost several
+    times over. This wrapper constructs the underlying ``decord.VideoReader``
+    lazily, caches it, and serves ``info`` / ``extract_frames`` /
+    ``extract_frames_1fps`` from that one reader. If decord is unavailable or
+    fails to open the file, it transparently falls back to the imageio path of
+    the module-level helpers.
+    """
+
+    def __init__(self, video_path: str) -> None:
+        self.video_path = video_path
+        self._vr: Any | None = None
+        self._info: tuple[int, float] | None = None
+        self._decord_failed = False
+
+    def _reader(self) -> Any | None:
+        if self._vr is not None or self._decord_failed:
+            return self._vr
+        try:
+            import decord
+
+            self._vr = decord.VideoReader(self.video_path, ctx=decord.cpu(0))
+        except Exception:
+            self._decord_failed = True
+            self._vr = None
+        return self._vr
+
+    def info(self) -> tuple[int, float]:
+        """Return cached ``(total_frames, fps)`` for the video."""
+        if self._info is not None:
+            return self._info
+        vr = self._reader()
+        if vr is not None:
+            total_frames = int(len(vr))
+            fps = float(vr.get_avg_fps() or 0.0)
+            if fps <= 0:
+                fps = 30.0
+            self._info = (total_frames, fps)
+        else:
+            self._info = extract_video_info(self.video_path)
+        return self._info
+
+    def extract_frames(self, frame_indices: list[int]) -> list[Image.Image]:
+        """Extract frames by raw index, reusing the cached reader."""
+        if not frame_indices:
+            return []
+        vr = self._reader()
+        if vr is not None:
+            try:
+                frames = vr.get_batch(frame_indices).asnumpy()
+                return [Image.fromarray(frame) for frame in frames]
+            except Exception:
+                try:
+                    return [Image.fromarray(vr[idx].asnumpy()) for idx in frame_indices]
+                except Exception:
+                    pass
+        return extract_frames(self.video_path, frame_indices)
+
+    def extract_frames_1fps(self, timeline_indices: list[int]) -> list[Image.Image]:
+        """Extract frames mapped from a 1fps timeline, reusing cached metadata."""
+        if not timeline_indices:
+            return []
+        total_frames, fps = self.info()
+        frame_indices = [timeline_to_frame_idx(i, fps, total_frames) for i in timeline_indices]
+        return self.extract_frames(frame_indices)
+
+
 # ---------------------------------------------------------------------------
 # Image encoding
 # ---------------------------------------------------------------------------
