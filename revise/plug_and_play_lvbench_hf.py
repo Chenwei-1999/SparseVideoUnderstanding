@@ -40,6 +40,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from revise import pnp_engine
+from revise.pnp_protocols import LoopConfig, RunStats
 from revise.pnp_utils import FORCE_ANSWER_INSTRUCTIONS_SIMPLE as _FORCE_ANSWER_INSTRUCTIONS
 from revise.pnp_utils import (
     ANSWER_RE,
@@ -354,6 +356,370 @@ def _load_model_and_processor(model_path: str, dtype: str, device: torch.device)
     return model, processor
 
 
+class LVBenchHFDataset:
+    """HF-side Video-MME/LVBench adapter for the shared PnP engine.
+
+    The sample loaders remain intentionally distinct from the vLLM long-video
+    loader: HF filters rows without answers and keeps question/video type
+    metadata instead of download URLs.
+    """
+
+    def __init__(
+        self,
+        *,
+        split: str,
+        video_cache_dir: str,
+        system_prompt: str,
+        videomme_use_official_prompt: bool = True,
+    ) -> None:
+        self.split = split
+        self.video_cache_dir = video_cache_dir
+        self.system_prompt_text = system_prompt
+        self.videomme_use_official_prompt = bool(videomme_use_official_prompt)
+        self.think_present = 0
+        self._current_sample: Optional[MCVideoSample] = None
+        self._frame_count_cache: dict[str, int] = {}
+
+    def _cache_path(self, sample: MCVideoSample) -> Path:
+        return Path(self.video_cache_dir) / sample.dataset / sample.video_key
+
+    def video_path(self, sample: MCVideoSample) -> str:
+        return str(self._cache_path(sample))
+
+    def frame_count(self, sample: MCVideoSample) -> int:
+        cached = self._frame_count_cache.get(sample.sample_id)
+        if cached is not None:
+            return cached
+        total_frames, fps = extract_video_info(self.video_path(sample))
+        timeline_len = timeline_len_1fps(total_frames, fps)
+        if timeline_len <= 0:
+            raise RuntimeError("invalid_video_timeline")
+        self._frame_count_cache[sample.sample_id] = timeline_len
+        return timeline_len
+
+    def video_id(self, sample: MCVideoSample) -> str:
+        return sample.video_key
+
+    def num_choices(self, sample: MCVideoSample) -> int:
+        return len(sample.options)
+
+    def normalize_answer(self, sample: MCVideoSample, answer_text: str) -> Optional[str]:
+        return normalize_answer_letter(answer_text, self.num_choices(sample))
+
+    def ground_truth_letter(self, sample: MCVideoSample) -> Optional[str]:
+        return normalize_answer_letter(sample.answer_letter, self.num_choices(sample))
+
+    def is_correct(self, sample: MCVideoSample, pred_letter: str) -> bool:
+        return pred_letter == self.ground_truth_letter(sample)
+
+    def log_fields(self, sample: MCVideoSample) -> dict[str, Any]:
+        return {
+            "dataset": sample.dataset,
+            "split": self.split,
+            "sample_id": sample.sample_id,
+            "uid": sample.uid,
+            "video_key": sample.video_key,
+            "video_id": sample.video_key,
+            "video_path": self.video_path(sample),
+            "question": sample.question,
+            "options": sample.options,
+            "answer_gt": sample.answer_letter,
+            "time_reference": sample.time_reference,
+            "question_type": sample.question_type,
+            "video_type": sample.video_type,
+        }
+
+    def format_question(self, sample: MCVideoSample) -> str:
+        self._current_sample = sample
+        if sample.dataset == "videomme" and self.videomme_use_official_prompt:
+            return format_videomme_question_block(sample.question, sample.options)
+        return format_question_block(sample.question, sample.options)
+
+    def system_prompt(self, cfg: LoopConfig) -> str:
+        _ = cfg
+        return self.system_prompt_text
+
+    def build_user_text(self, **kwargs: Any) -> str:
+        sample = self._current_sample
+        return _build_user_text(
+            question_block=kwargs["question_block"],
+            summary=kwargs["summary"],
+            timeline_len=kwargs["frame_count"],
+            round_idx=kwargs["round_idx"],
+            current_frames=kwargs["frame_indices"],
+            seen_frames=kwargs["seen_frames"],
+            candidate_unseen_frames=kwargs.get("candidate_unseen_frames") or [],
+            use_candidate_frame_ids=bool(kwargs.get("use_candidate_frame_ids", False)),
+            require_candidate_frames=bool(kwargs.get("require_candidate_frames", False)),
+            time_reference=sample.time_reference if sample is not None else "",
+        )
+
+    def extract_frames(self, sample: MCVideoSample, indices: list[int]) -> list[Image.Image]:
+        return extract_frames_1fps(self.video_path(sample), indices)
+
+    def sample_unseen_frames(self, frame_count: int, seen: set[int], k: int, rng: random.Random) -> list[int]:
+        if frame_count <= 0 or k <= 0:
+            return []
+        candidates = [i for i in range(frame_count) if i not in seen]
+        if not candidates:
+            return []
+        return sorted(rng.sample(candidates, k=min(k, len(candidates))))
+
+    def _active_range(self, sample: MCVideoSample, frame_count: int) -> tuple[int, int]:
+        if sample.time_reference:
+            parsed = parse_time_reference_range(sample.time_reference, frame_count)
+            if parsed is not None:
+                return parsed
+        return 0, max(0, int(frame_count) - 1)
+
+    def initial_frame_indices(self, sample: MCVideoSample, frame_count: int, cfg: LoopConfig) -> list[int]:
+        start, end = self._active_range(sample, frame_count)
+        return sample_uniform_indices_inclusive(start, end, int(cfg.max_frames_per_round))
+
+    def candidate_frame_indices(
+        self,
+        sample: MCVideoSample,
+        *,
+        frame_count: int,
+        seen_frames: list[int],
+        k: int,
+        rng: random.Random,
+    ) -> list[int]:
+        start, end = self._active_range(sample, frame_count)
+        local_len = max(0, end - start + 1)
+        if local_len <= 0:
+            return []
+        seen_local = {int(i - start) for i in seen_frames if start <= int(i) <= end}
+        cand_local = propose_candidate_frames(frame_count=local_len, seen=seen_local, k=int(k), rng=rng)
+        return [int(i + start) for i in cand_local]
+
+    def fallback_frame_indices(self, sample: MCVideoSample, frame_count: int, k: int, cfg: LoopConfig) -> list[int]:
+        _ = cfg
+        start, end = self._active_range(sample, frame_count)
+        return sample_uniform_indices_inclusive(start, end, int(k))
+
+    def retry_feedback_text(
+        self,
+        reason: str,
+        *,
+        force_answer: bool = False,
+        max_frames_per_round: int = 0,
+        frame_count: int = 0,
+        seen_frames: Optional[list[int]] = None,
+    ) -> str:
+        _ = max_frames_per_round, frame_count, seen_frames
+        messages = {
+            "missing_think": (
+                "Invalid response: every response MUST begin with a <think>...</think> reasoning trace, "
+                "then either <summarize> + <select> (request) or <answer> (final)."
+            ),
+            "invalid_answer_letter": "Invalid response: <answer> must be a single option letter.",
+            "invalid_select_summary": "Invalid response: missing <summarize> tag.",
+            "missing_frames_tag": "Invalid response: missing <select> tag for requesting more frames.",
+            "invalid_frames": "Invalid response: <select> must contain at least one integer.",
+            "frames_not_in_candidates": "Invalid response: requested frames must be within candidate IDs.",
+            "frames_already_seen": "Invalid response: requested frames must be NEW (unseen).",
+        }
+        return _retry_feedback_text(messages.get(reason, reason), force_answer=force_answer)
+
+    def load_video_captions(self, captions_dir: str, video_id: str) -> dict[int, str]:
+        _ = captions_dir, video_id
+        return {}
+
+    def get_video_fps(self, video_path: str) -> float:
+        _ = video_path
+        return 0.0
+
+    def caption_key_for_frame_index(self, frame_idx: int, fps: float) -> int:
+        _ = fps
+        return int(frame_idx)
+
+    def parse_think(self, raw: str) -> Optional[str]:
+        think = extract_tag(raw, THINK_RE)
+        if think is not None:
+            self.think_present += 1
+        return think
+
+    def parse_summary(self, raw: str) -> Optional[str]:
+        return extract_tag(raw, SUMMARIZE_RE)
+
+    def parse_answer(self, raw: str) -> Optional[str]:
+        return extract_tag(raw, ANSWER_RE)
+
+    def parse_select(self, raw: str) -> Optional[str]:
+        return extract_tag(raw, SELECT_RE)
+
+    def should_commit_summary(self, summary: Optional[str], *, seen_count: int) -> bool:
+        _ = seen_count
+        return summary is not None
+
+    def is_select_summary_valid(self, summary: Optional[str], *, seen_count: int) -> bool:
+        _ = seen_count
+        return summary is not None
+
+    def is_summary_stale(self, summary: Optional[str], *, seen_count: int) -> bool:
+        _ = summary, seen_count
+        return False
+
+    def select_has_range_syntax(self, frames_text: str) -> bool:
+        _ = frames_text
+        return False
+
+    def parse_select_frames(self, frames_text: str) -> list[int]:
+        return dedupe_preserve_order(parse_int_list(frames_text))
+
+    def map_candidate_frame_ids(
+        self,
+        requested_ids: list[int],
+        candidate_frames: list[int],
+    ) -> Optional[list[int]]:
+        mapped: list[int] = []
+        allowed = {int(x) for x in candidate_frames}
+        for cid in requested_ids:
+            if 1 <= int(cid) <= len(candidate_frames):
+                mapped.append(int(candidate_frames[int(cid) - 1]))
+            elif int(cid) in allowed:
+                mapped.append(int(cid))
+        return dedupe_preserve_order(mapped)
+
+    def filter_requested_frames(
+        self,
+        requested_frames: list[int],
+        *,
+        frame_count: int,
+        seen_frames: list[int],
+        candidate_frames: list[int],
+        require_candidate_frames: bool = False,
+    ) -> tuple[list[int], Optional[str]]:
+        _ = frame_count
+        requested = [int(i) for i in requested_frames]
+        if require_candidate_frames and candidate_frames:
+            allowed = {int(i) for i in candidate_frames}
+            if any(i not in allowed for i in requested):
+                return [], "frames_not_in_candidates"
+        if any(i in seen_frames for i in requested):
+            return [], "frames_already_seen"
+        return requested, None
+
+    def initial_summary(self, cfg: LoopConfig) -> str:
+        _ = cfg
+        return (
+            "P: the agent has not seen any frames yet; "
+            "O: no reliable observation yet; "
+            "H: my belief will be updated based on what is observed; "
+            "U: key detail is still unclear; "
+            "R: need evidence from frames"
+        )
+
+    def final_round_instruction(self, cfg: LoopConfig) -> Optional[str]:
+        _ = cfg
+        return (
+            "This is the final round. You MUST answer now using <think>...</think> then "
+            "<think>...</think> then <answer>LETTER</answer>."
+        )
+
+    def final_answer_instruction(self, cfg: LoopConfig) -> Optional[str]:
+        _ = cfg
+        return "You MUST answer now. Output <think>...</think> then <answer>LETTER</answer>."
+
+    def forced_answer_request(
+        self,
+        sample: MCVideoSample,
+        *,
+        question_block: str,
+        frame_count: int,
+        max_rounds: int,
+        system_prompt: str,
+        last_user_text: str,
+        last_images: list[Any],
+    ) -> tuple[str, str, list[Any]]:
+        _ = sample, frame_count, max_rounds, system_prompt, last_user_text
+        user_text = (
+            f"{question_block}\n"
+            "You MUST answer now. Output <think>...</think> then <answer>LETTER</answer>."
+        )
+        return self.system_prompt_text, user_text, last_images
+
+    def should_terminate_on_invalid_summary(self, cfg: LoopConfig) -> bool:
+        _ = cfg
+        return False
+
+    def should_fail_on_empty_images(self, cfg: LoopConfig) -> bool:
+        _ = cfg
+        return False
+
+    def should_count_exhausted_invalid_as_retry(self, reason: str) -> bool:
+        return reason in {
+            "missing_think",
+            "invalid_answer_letter",
+            "invalid_select_summary",
+            "missing_frames_tag",
+            "frames_not_in_candidates",
+            "frames_already_seen",
+            "invalid_frames",
+        }
+
+    def should_clear_frame_plan_on_exhausted_invalid(self, reason: str) -> bool:
+        return reason in {
+            "missing_think",
+            "invalid_answer_letter",
+            "invalid_select_summary",
+            "missing_frames_tag",
+            "frames_not_in_candidates",
+            "frames_already_seen",
+            "invalid_frames",
+        }
+
+    def should_retry_invalid_output(self, reason: str) -> bool:
+        return reason != "too_many_frames"
+
+
+class HFInProcessBackend:
+    def __init__(
+        self,
+        *,
+        model: Any,
+        processor: Any,
+        device: torch.device,
+        max_len: int,
+    ) -> None:
+        self.model = model
+        self.processor = processor
+        self.device = device
+        self.max_len = int(max_len)
+
+    def chat(
+        self,
+        *,
+        base_url: str,
+        model_id: str,
+        system_prompt: str,
+        user_text: str,
+        images: list[Any],
+        temperature: float,
+        top_p: float,
+        max_tokens: int,
+        timeout_s: int,
+    ) -> str:
+        _ = base_url, model_id, timeout_s
+        return _chat_once_hf(
+            model=self.model,
+            processor=self.processor,
+            system_prompt=system_prompt,
+            user_text=user_text,
+            images=images,
+            device=self.device,
+            max_new_tokens=int(max_tokens),
+            temperature=float(temperature),
+            top_p=float(top_p),
+            max_len=self.max_len,
+        )
+
+    def get_model_id(self, base_url: str, model_id: Optional[str] = None) -> str:
+        _ = base_url
+        return model_id or "hf-in-process"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", choices=["videomme", "lvbench"], default="lvbench")
@@ -468,17 +834,43 @@ def main() -> None:
     run = maybe_init_wandb(args, run_config)
 
     rng = random.Random(1337 + int(args.shard_idx))
+    stats = RunStats()
+    dataset_adapter = LVBenchHFDataset(
+        split=split,
+        video_cache_dir=args.video_cache_dir,
+        system_prompt=str(args.system_prompt or ""),
+        videomme_use_official_prompt=bool(args.videomme_use_official_prompt),
+    )
+    backend = HFInProcessBackend(model=model, processor=processor, device=device, max_len=max_len)
+    cfg = LoopConfig(
+        max_rounds=args.max_rounds,
+        max_frames_per_round=args.max_frames_per_round,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_new_tokens,
+        request_timeout_s=0,
+        max_retries_per_round=args.max_retries_per_round,
+        strict_actions=False,
+        force_final_answer=bool(args.force_final_answer),
+        use_candidate_frames=True,
+        candidate_k=int(args.candidate_k),
+        use_candidate_frame_ids=bool(args.use_candidate_frame_ids),
+        require_candidate_frames=bool(args.require_candidate_frames),
+        answer_only_final_round=False,
+        observation_mode="image",
+        caption_include="none",
+        caption_max_chars=0,
+        captions_dir=None,
+        hide_seen_frames_in_prompt=False,
+        log_jsonl=args.log_jsonl or None,
+        seed=1337 + int(args.shard_idx),
+    )
 
     correct = 0
-    failed = 0
-    invalid_outputs = 0
     invalid_action_terminated = 0
     total_rounds = 0
     total_effective_rounds = 0
     total_frames_used = 0
-    total_model_calls = 0
-    total_retries = 0
-    think_present = 0
 
     cache_dir = Path(args.video_cache_dir) / args.dataset
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -487,10 +879,10 @@ def main() -> None:
     for sample in samples:
         processed += 1
         processed_global = processed + resume_completed
+        video_path = dataset_adapter.video_path(sample)
 
-        video_path = str(cache_dir / sample.video_key)
         if not os.path.exists(video_path) or os.path.getsize(video_path) <= 0:
-            failed += 1
+            stats.failed += 1
             maybe_log_jsonl(
                 args.log_jsonl,
                 {
@@ -507,10 +899,19 @@ def main() -> None:
             continue
 
         try:
-            total_frames, fps = extract_video_info(video_path)
-            timeline_len = timeline_len_1fps(total_frames, fps)
+            outcome = pnp_engine.run_sample(
+                sample,
+                dataset=dataset_adapter,
+                backend=backend,
+                cfg=cfg,
+                stats=stats,
+                rng=rng,
+                base_url="",
+                model_id=backend.get_model_id("", model_id=args.model_path),
+                run=run,
+            )
         except Exception as e:
-            failed += 1
+            stats.failed += 1
             maybe_log_jsonl(
                 args.log_jsonl,
                 {
@@ -521,308 +922,25 @@ def main() -> None:
                     "uid": sample.uid,
                     "video_key": sample.video_key,
                     "video_path": video_path,
-                    "error": f"video_probe_failed: {type(e).__name__}: {str(e)[:400]}",
+                    "error": f"{type(e).__name__}: {str(e)[:400]}",
                 },
             )
             continue
 
-        if timeline_len <= 0:
-            failed += 1
-            continue
-
-        time_range = None
-        if sample.time_reference:
-            time_range = parse_time_reference_range(sample.time_reference, timeline_len)
-        if time_range is None:
-            range_start, range_end = 0, timeline_len - 1
-        else:
-            range_start, range_end = time_range
-
-        if sample.dataset == "videomme" and args.videomme_use_official_prompt:
-            question_block = format_videomme_question_block(sample.question, sample.options)
-        else:
-            question_block = format_question_block(sample.question, sample.options)
-        summary_state = (
-            "P: the agent has not seen any frames yet; "
-            "O: no reliable observation yet; "
-            "H: my belief will be updated based on what is observed; "
-            "U: key detail is still unclear; "
-            "R: need evidence from frames"
-        )
-        seen_frames: list[int] = []
-        answer_letter: Optional[str] = None
-        effective_rounds = 0
-        terminated_invalid = False
-
-        init_frames = sample_uniform_indices_inclusive(range_start, range_end, int(args.max_frames_per_round))
-        next_frames = [int(i) for i in init_frames if i >= 0]
-
-        for round_idx in range(1, int(args.max_rounds) + 1):
-            frames_this_round = [i for i in next_frames if i not in seen_frames]
-            if not frames_this_round:
-                frames_this_round = sample_uniform_indices_inclusive(range_start, range_end, 1)
-            frames_this_round = frames_this_round[: int(args.max_frames_per_round)]
-            for i in frames_this_round:
-                if i not in seen_frames:
-                    seen_frames.append(i)
-
-            local_len = max(0, range_end - range_start + 1)
-            if local_len <= 0:
-                candidate_next_frames = []
-            else:
-                seen_local = {int(i - range_start) for i in seen_frames if range_start <= i <= range_end}
-                cand_local = propose_candidate_frames(
-                    frame_count=local_len,
-                    seen=seen_local,
-                    k=int(args.candidate_k),
-                    rng=rng,
-                )
-                candidate_next_frames = [int(i + range_start) for i in cand_local]
-
-            images = extract_frames_1fps(video_path, frames_this_round)
-            user_text = _build_user_text(
-                question_block=question_block,
-                summary=summary_state,
-                timeline_len=timeline_len,
-                round_idx=round_idx,
-                current_frames=frames_this_round,
-                seen_frames=seen_frames,
-                candidate_unseen_frames=candidate_next_frames,
-                use_candidate_frame_ids=bool(args.use_candidate_frame_ids),
-                require_candidate_frames=bool(args.require_candidate_frames),
-                time_reference=sample.time_reference,
-            )
-            if args.force_final_answer and round_idx >= int(args.max_rounds):
-                user_text = (
-                    f"{user_text}\n\n"
-                    "This is the final round. You MUST answer now using <think>...</think> then "
-                    "<think>...</think> then <answer>LETTER</answer>."
-                )
-
-            retry_feedback: Optional[str] = None
-            raw_output = ""
-            for retry_idx in range(int(args.max_retries_per_round) + 1):
-                try:
-                    raw_output = _chat_once_hf(
-                        model=model,
-                        processor=processor,
-                        system_prompt=str(args.system_prompt or ""),
-                        user_text=user_text
-                        if retry_feedback is None
-                        else _retry_feedback_text(
-                            retry_feedback,
-                            force_answer=bool(args.force_final_answer and round_idx >= int(args.max_rounds)),
-                        ),
-                        images=images,
-                        device=device,
-                        max_new_tokens=int(args.max_new_tokens),
-                        temperature=float(args.temperature),
-                        top_p=float(args.top_p),
-                        max_len=max_len,
-                    )
-                    total_model_calls += 1
-                except Exception as e:
-                    err_txt = f"{type(e).__name__}: {str(e)[:400]}"
-                    retry_feedback = f"Model error; please retry. ({err_txt})"
-                    total_retries += 1
-                    if retry_idx < int(args.max_retries_per_round):
-                        continue
-                    failed += 1
-                    maybe_log_jsonl(
-                        args.log_jsonl,
-                        {
-                            "ts": time.time(),
-                            "dataset": sample.dataset,
-                            "split": split,
-                            "sample_id": sample.sample_id,
-                            "uid": sample.uid,
-                            "video_key": sample.video_key,
-                            "video_path": video_path,
-                            "round_idx": round_idx,
-                            "error": f"model_error: {err_txt}",
-                        },
-                    )
-                    break
-
-                # Paper protocol: every response MUST begin with a <think> trace.
-                think = extract_tag(raw_output, THINK_RE)
-                if think is None:
-                    retry_feedback = (
-                        "Invalid response: every response MUST begin with a <think>...</think> reasoning trace, "
-                        "then either <summarize> + <select> (request) or <answer> (final)."
-                    )
-                    invalid_outputs += 1
-                    total_retries += 1
-                    continue
-                think_present += 1
-
-                summary = extract_tag(raw_output, SUMMARIZE_RE)
-                frames_text = extract_tag(raw_output, SELECT_RE)
-                answer = extract_tag(raw_output, ANSWER_RE)
-
-                if answer is not None:
-                    # Strict-paper Answer round: <think> + <answer> only; the last committed
-                    # <summarize> (set on the prior Select round) is reused as the state.
-                    letter = normalize_answer_letter(answer, len(sample.options))
-                    if letter is None:
-                        retry_feedback = "Invalid response: <answer> must be a single option letter."
-                        invalid_outputs += 1
-                        total_retries += 1
-                        continue
-                    answer_letter = letter
-                    if summary is not None:
-                        summary_state = summary
-                    break
-
-                # Select round: require a <summarize> then a <select> request.
-                if summary is None:
-                    retry_feedback = "Invalid response: missing <summarize> tag."
-                    invalid_outputs += 1
-                    total_retries += 1
-                    continue
-
-                if frames_text is None:
-                    retry_feedback = "Invalid response: missing <select> tag for requesting more frames."
-                    invalid_outputs += 1
-                    total_retries += 1
-                    continue
-
-                requested = dedupe_preserve_order(parse_int_list(frames_text))
-                if not requested:
-                    retry_feedback = "Invalid response: <select> must contain at least one integer."
-                    invalid_outputs += 1
-                    total_retries += 1
-                    continue
-
-                if len(requested) > int(args.max_frames_per_round):
-                    requested = requested[: int(args.max_frames_per_round)]
-                    invalid_outputs += 1
-
-                mapped = requested
-                if args.use_candidate_frame_ids and candidate_next_frames:
-                    mapped2: list[int] = []
-                    allowed = set(int(x) for x in candidate_next_frames)
-                    for cid in requested:
-                        if 1 <= cid <= len(candidate_next_frames):
-                            mapped2.append(int(candidate_next_frames[cid - 1]))
-                        elif cid in allowed:
-                            mapped2.append(int(cid))
-                    mapped = mapped2
-                if args.require_candidate_frames and candidate_next_frames:
-                    allowed = set(int(x) for x in candidate_next_frames)
-                    if any(x not in allowed for x in mapped):
-                        retry_feedback = "Invalid response: requested frames must be within candidate IDs."
-                        invalid_outputs += 1
-                        total_retries += 1
-                        continue
-
-                if any(x in seen_frames for x in mapped):
-                    retry_feedback = "Invalid response: requested frames must be NEW (unseen)."
-                    invalid_outputs += 1
-                    total_retries += 1
-                    continue
-
-                if mapped:
-                    next_frames = mapped
-                    effective_rounds += 1
-                else:
-                    next_frames = candidate_next_frames[: int(args.max_frames_per_round)]
-                    invalid_outputs += 1
-
-                summary_state = summary
-                break
-
-            maybe_log_jsonl(
-                args.log_jsonl,
-                {
-                    "ts": time.time(),
-                    "dataset": sample.dataset,
-                    "split": split,
-                    "sample_id": sample.sample_id,
-                    "uid": sample.uid,
-                    "video_key": sample.video_key,
-                    "video_path": video_path,
-                    "timeline_len": timeline_len,
-                    "round_idx": round_idx,
-                    "retry_feedback": retry_feedback,
-                    "question": sample.question,
-                    "options": sample.options,
-                    "answer_gt": sample.answer_letter,
-                    "time_reference": sample.time_reference,
-                    "question_type": sample.question_type,
-                    "video_type": sample.video_type,
-                    "seen_frames": seen_frames,
-                    "current_frames": frames_this_round,
-                    "candidate_unseen_frames": candidate_next_frames,
-                    "summary_in": summary_state,
-                    "raw_output": raw_output,
-                    "answer_letter": answer_letter,
-                },
-            )
-
-            if answer_letter is not None:
-                total_rounds += round_idx
-                total_effective_rounds += effective_rounds
-                total_frames_used += len(frames_this_round)
-                gt = normalize_answer_letter(sample.answer_letter, len(sample.options))
-                if gt is not None and answer_letter == gt:
-                    correct += 1
-                break
-
-        if answer_letter is None and args.force_final_answer:
-            # If we still have no answer, force one extra call (answer-only).
-            images = extract_frames_1fps(video_path, frames_this_round)
-            user_text2 = (
-                f"{question_block}\n"
-                "You MUST answer now. Output <think>...</think> then <answer>LETTER</answer>."
-            )
-            try:
-                raw = _chat_once_hf(
-                    model=model,
-                    processor=processor,
-                    system_prompt=str(args.system_prompt or ""),
-                    user_text=user_text2,
-                    images=images,
-                    device=device,
-                    max_new_tokens=int(args.max_new_tokens),
-                    temperature=float(args.temperature),
-                    top_p=float(args.top_p),
-                    max_len=max_len,
-                )
-            except Exception as e:
-                failed += 1
-                maybe_log_jsonl(
-                    args.log_jsonl,
-                    {
-                        "ts": time.time(),
-                        "dataset": sample.dataset,
-                        "split": split,
-                        "sample_id": sample.sample_id,
-                        "uid": sample.uid,
-                        "video_key": sample.video_key,
-                        "video_path": video_path,
-                        "round_idx": int(args.max_rounds),
-                        "error": f"model_error_final_answer: {type(e).__name__}: {str(e)[:400]}",
-                    },
-                )
-                continue
-            total_model_calls += 1
-            ans = extract_tag(raw, ANSWER_RE)
-            summary = extract_tag(raw, SUMMARIZE_RE)
-            letter = normalize_answer_letter(ans or "", len(sample.options))
-            if letter is not None:
-                answer_letter = letter
-                total_rounds += int(args.max_rounds)
-                total_effective_rounds += effective_rounds
-                total_frames_used += len(frames_this_round)
-                gt = normalize_answer_letter(sample.answer_letter, len(sample.options))
-                if gt is not None and answer_letter == gt:
-                    correct += 1
-            else:
-                terminated_invalid = True
-
-        if terminated_invalid:
+        if outcome.answer_letter is not None:
+            total_rounds += min(outcome.round_idx, int(args.max_rounds))
+            total_effective_rounds += outcome.effective_rounds
+            total_frames_used += int(outcome.answer_frame_count)
+            if dataset_adapter.is_correct(sample, outcome.answer_letter):
+                correct += 1
+        elif args.force_final_answer:
             invalid_action_terminated += 1
+
+        failed = stats.failed
+        invalid_outputs = stats.invalid_outputs
+        total_model_calls = stats.total_model_calls
+        total_retries = stats.total_retries
+        think_present = dataset_adapter.think_present
 
         if run is not None:
             wandb_log(
@@ -845,6 +963,12 @@ def main() -> None:
                 f"[{args.dataset}] processed {processed_global} / {len(samples)+resume_completed} | "
                 f"acc={acc_so_far:.4f} failed={failed} invalid={invalid_outputs} calls={total_model_calls}"
             )
+
+    failed = stats.failed
+    invalid_outputs = stats.invalid_outputs
+    total_model_calls = stats.total_model_calls
+    total_retries = stats.total_retries
+    think_present = dataset_adapter.think_present
 
     answered = max(0, len(samples) + resume_completed - failed)
     summary = {

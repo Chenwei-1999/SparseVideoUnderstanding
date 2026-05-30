@@ -19,6 +19,7 @@ class SampleOutcome:
     effective_rounds: int
     terminated_reason: Optional[str]
     terminated_invalid_action: bool
+    answer_frame_count: int = 0
 
 
 _LOG_PREFIX_FIELDS = ("sample_id", "qid", "video_id", "video_path")
@@ -109,6 +110,7 @@ def run_sample(
     last_user_text: Optional[str] = None
     last_images: list[Any] = []
     last_frames: list[int] = []
+    answer_frame_count = 0
 
     def _count_exhausted_invalid_as_retry(reason: str) -> None:
         if dataset.should_count_exhausted_invalid_as_retry(reason):
@@ -371,6 +373,7 @@ def run_sample(
                 # Strict-paper Answer round: <think> + <answer> only. No <summarize>
                 # is required here; the last committed summary is reused as the state
                 # (captured above when a valid <summarize> was present on a Select round).
+                answer_frame_count = len(frames_this_round)
                 break
 
             frames_text = dataset.parse_select(raw)
@@ -639,6 +642,7 @@ def run_sample(
         )
         if final_answer_letter:
             answer_letter = final_answer_letter
+            answer_frame_count = len(last_frames)
 
     return SampleOutcome(
         answer_letter=answer_letter,
@@ -647,4 +651,5 @@ def run_sample(
         effective_rounds=effective_rounds,
         terminated_reason=terminated_reason,
         terminated_invalid_action=terminated_invalid_action,
+        answer_frame_count=answer_frame_count,
     )
