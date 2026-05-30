@@ -38,6 +38,7 @@ import torch
 from PIL import Image
 
 import revise.oneshot_lvbench_hf as oneshot
+import revise.plug_and_play_lvbench_hf as lvbench_hf
 
 
 _VOLATILE = ("ts",)
@@ -140,18 +141,20 @@ def _run_loop(scripted_outputs, *, sample_count=None):
             "--summary-json", summary_path,
             "--log-jsonl", log_path,
         ]
-        # All seams are called by BARE NAME inside oneshot.main(): the loader,
-        # video probe, frame extraction, and the model/processor (loaded via
-        # _load_model_and_processor). Patching the oneshot module namespace drives
-        # the script identically before and after the migration.
+        # The loader, model/processor load, wandb, and yt-dlp download are called
+        # by bare name in oneshot.main(), so they are patched on the oneshot
+        # module. The migrated launcher reuses LVBenchHFDataset from
+        # plug_and_play_lvbench_hf, whose frame probe / extraction are called by
+        # bare name THERE, so those seams are patched on that module (matching the
+        # multi-round HF golden's convention).
         with patch.object(sys, "argv", argv), \
                 patch.object(oneshot, "_load_lvbench_samples", return_value=samples), \
                 patch.object(oneshot, "_load_model_and_processor", return_value=(model, processor)), \
                 patch.object(oneshot, "_maybe_init_wandb", return_value=None), \
                 patch.object(oneshot, "_wandb_log", return_value=None), \
-                patch.object(oneshot, "_extract_video_info", return_value=(8, 1.0)), \
-                patch.object(oneshot, "_extract_frames_1fps", side_effect=fake_extract_frames_1fps), \
-                patch.object(oneshot, "_download_youtube") as download_youtube:
+                patch.object(oneshot, "_download_youtube") as download_youtube, \
+                patch.object(lvbench_hf, "extract_video_info", return_value=(8, 1.0)), \
+                patch.object(lvbench_hf, "extract_frames_1fps", side_effect=fake_extract_frames_1fps):
             rc = oneshot.main()
         download_youtube.assert_not_called()
         summary = json.load(open(summary_path, encoding="utf-8"))

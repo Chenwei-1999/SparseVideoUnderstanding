@@ -26,19 +26,13 @@ from revise.pnp_utils import (
     collapse_ws as _collapse_ws,
     configure_llava_processor,
     ensure_writable_hf_cache,
-    extract_frames_1fps as _extract_frames_1fps,
-    extract_video_info as _extract_video_info,
-    format_question_block as _format_question_block,
     maybe_init_wandb as _maybe_init_wandb,
     parse_options_from_lvbench_question as _parse_options_from_lvbench_question,
-    parse_time_reference_range as _parse_time_reference_range,
-    sample_uniform_indices_inclusive as _sample_uniform_indices_inclusive,
     shard_by_video as _shard_by_video,
     stable_sample_id_dataset as _stable_sample_id,
-    timeline_len_1fps as _timeline_len_1fps,
     wandb_log as _wandb_log,
 )
-from revise.plug_and_play_lvbench_hf import HFInProcessBackend
+from revise.plug_and_play_lvbench_hf import HFInProcessBackend, LVBenchHFDataset
 
 ensure_writable_hf_cache(REPO_ROOT / "data" / "revise_assets" / "hf_home")
 
@@ -181,80 +175,6 @@ def _load_model_and_processor(model_path: str, dtype: str, device: torch.device)
     return model, processor
 
 
-class OneshotLVBenchHFDataset:
-    """Single-round (one-shot) LVBench adapter for the shared PnP engine.
-
-    Only the methods exercised by :func:`revise.pnp_engine.run_sample_oneshot`
-    are implemented: ``frame_count`` / ``format_question`` /
-    ``initial_frame_indices`` / ``extract_frames`` / ``oneshot_user_text`` /
-    ``normalize_answer`` / ``is_correct`` / ``video_path``. Frame probing and
-    extraction go through this module's bare-name helpers so they share the same
-    patch surface as the legacy standalone loop.
-    """
-
-    def __init__(self, *, split: str, video_cache_dir: str) -> None:
-        self.split = split
-        self.video_cache_dir = video_cache_dir
-
-    def _cache_path(self, sample: MCVideoSample) -> Path:
-        return Path(self.video_cache_dir) / sample.dataset / sample.video_key
-
-    def video_path(self, sample: MCVideoSample) -> str:
-        return str(self._cache_path(sample))
-
-    def frame_count(self, sample: MCVideoSample) -> int:
-        total_frames, fps = _extract_video_info(self.video_path(sample))
-        return _timeline_len_1fps(total_frames, fps)
-
-    def num_choices(self, sample: MCVideoSample) -> int:
-        return len(sample.options)
-
-    def normalize_answer(self, sample: MCVideoSample, answer_text: str) -> Optional[str]:
-        return _normalize_answer_letter(answer_text, self.num_choices(sample))
-
-    def ground_truth_letter(self, sample: MCVideoSample) -> Optional[str]:
-        return _normalize_answer_letter(sample.answer_letter, self.num_choices(sample))
-
-    def is_correct(self, sample: MCVideoSample, pred_letter: str) -> bool:
-        gt = self.ground_truth_letter(sample)
-        return bool(pred_letter and gt and pred_letter == gt)
-
-    def format_question(self, sample: MCVideoSample) -> str:
-        return _format_question_block(sample.question, sample.options)
-
-    def _active_range(self, sample: MCVideoSample, frame_count: int) -> tuple[int, int]:
-        if sample.time_reference:
-            parsed = _parse_time_reference_range(sample.time_reference, frame_count)
-            if parsed is not None:
-                return parsed
-        return 0, max(0, int(frame_count) - 1)
-
-    def initial_frame_indices(self, sample: MCVideoSample, frame_count: int, cfg: LoopConfig) -> list[int]:
-        start, end = self._active_range(sample, frame_count)
-        return _sample_uniform_indices_inclusive(start, end, int(cfg.max_frames_per_round))
-
-    def extract_frames(self, sample: MCVideoSample, indices: list[int]) -> list[Any]:
-        return _extract_frames_1fps(self.video_path(sample), indices)
-
-    def oneshot_user_text(
-        self,
-        question_block: str,
-        num_frames: int,
-        *,
-        frame_indices: Optional[list[int]] = None,
-    ) -> str:
-        # Bare prompt text WITHOUT per-frame <image> placeholders: the HF backend
-        # (`_chat_once_hf`) prepends one image placeholder per frame, reproducing
-        # the legacy images-first conversation layout. Kept byte-identical to the
-        # legacy standalone ``prompt_text``.
-        _ = num_frames, frame_indices
-        return (
-            f"{question_block}\n\n"
-            "You will be given video frames sampled at 1 fps.\n"
-            "Answer with EXACTLY ONE option letter (e.g., A/B/C/D). Do not output any other text."
-        )
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="train")
@@ -362,17 +282,23 @@ def main() -> None:
     cache_dir = Path(args.video_cache_dir) / "lvbench"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build the shared single-round (one-shot) Dataset adapter + the HF in-process
-    # backend, then delegate the eval loop to the shared harness
-    # (setting="oneshot_baseline"). The adapter reuses this module's bare-name
-    # frame helpers; the harness owns the video-existence skip (never downloads),
+    # Reuse the shared multi-round HF adapter (LVBenchHFDataset) for the
+    # single-round baseline: run_sample_oneshot only exercises
+    # frame_count / format_question / initial_frame_indices / extract_frames /
+    # oneshot_user_text / normalize_answer / is_correct, all of which it already
+    # implements. The harness owns the video-existence skip (never downloads),
     # scoring, logging, and this launcher's own summary schema.
     #
     # Behavioral deltas vs. the legacy standalone loop (consistent with the
     # multi-round HF migration): no yt-dlp download / `.failed` markers, no 3x
     # inference retry, and no prompt-length truncation. Samples whose video is
     # absent are counted as failed (existence skip); model errors propagate.
-    dataset_adapter = OneshotLVBenchHFDataset(split=split, video_cache_dir=args.video_cache_dir)
+    dataset_adapter = LVBenchHFDataset(
+        split=split,
+        video_cache_dir=args.video_cache_dir,
+        system_prompt="",
+        videomme_use_official_prompt=False,
+    )
     backend = HFInProcessBackend(model=model, processor=processor, device=device, max_len=max_len)
     cfg = LoopConfig(
         max_rounds=1,

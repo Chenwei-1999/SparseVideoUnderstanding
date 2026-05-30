@@ -457,6 +457,25 @@ class LVBenchHFDataset:
     def extract_frames(self, sample: MCVideoSample, indices: list[int]) -> list[Image.Image]:
         return extract_frames_1fps(self.video_path(sample), indices)
 
+    def oneshot_user_text(
+        self,
+        question_block: str,
+        num_frames: int,
+        *,
+        frame_indices: Optional[list[int]] = None,
+    ) -> str:
+        # Single-round (one-shot baseline) prompt for the HF in-process backend.
+        # Returns the bare prompt text WITHOUT per-frame <image> placeholders:
+        # ``_chat_once_hf`` prepends one image placeholder per frame, reproducing
+        # the legacy ``oneshot_lvbench_hf`` images-first conversation layout. This
+        # adapter enumerates frames by ordinal, so ``frame_indices`` is ignored.
+        _ = num_frames, frame_indices
+        return (
+            f"{question_block}\n\n"
+            "You will be given video frames sampled at 1 fps.\n"
+            "Answer with EXACTLY ONE option letter (e.g., A/B/C/D). Do not output any other text."
+        )
+
     def sample_unseen_frames(self, frame_count: int, seen: set[int], k: int, rng: random.Random) -> list[int]:
         if frame_count <= 0 or k <= 0:
             return []
