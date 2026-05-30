@@ -81,9 +81,6 @@ from revise.pnp_utils import (
     wandb_log,
 )
 
-ensure_writable_hf_cache(REPO_ROOT / "data" / "revise_assets" / "hf_home")
-from datasets import load_dataset
-
 FINAL_ANSWER_SYSTEM_PROMPT = (
     "You are a multiple-choice video QA assistant. "
     "Return exactly <think>...</think> then <answer>LETTER</answer>. "
@@ -215,6 +212,25 @@ class MCVideoSample:
     @property
     def sample_id(self) -> str:
         return stable_sample_id_dataset(self.dataset, self.video_key, self.uid)
+
+
+def load_dataset(*args, **kwargs):
+    """Lazily import HF ``datasets`` so this vLLM-client module stays import-light.
+
+    ``datasets`` / ``huggingface_hub`` read their cache-location env vars at
+    import time, so point them at the writable asset cache *before* importing.
+    Keeping this lazy means tooling that merely imports this module (tests,
+    ``--help``, the paper-suite command builder) does not pull in the
+    multi-gigabyte HF/torch stack.
+
+    Kept as a module-level name (not ``_load_dataset``) so the loaders' call
+    sites remain monkeypatchable as ``<module>.load_dataset`` -- a seam the
+    characterization tests rely on.
+    """
+    ensure_writable_hf_cache(REPO_ROOT / "data" / "revise_assets" / "hf_home")
+    from datasets import load_dataset as _hf_load_dataset
+
+    return _hf_load_dataset(*args, **kwargs)
 
 
 def _load_videomme_samples(split: str) -> list[MCVideoSample]:
