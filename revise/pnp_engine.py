@@ -22,6 +22,83 @@ class SampleOutcome:
     answer_frame_count: int = 0
 
 
+@dataclass
+class OneshotOutcome:
+    """Result of a single-round (one-shot) baseline sample.
+
+    ``failed_reason`` is ``None`` on a clean single chat; otherwise the model was
+    never queried (e.g. an empty timeline or no extracted frames) and the harness
+    counts the sample as failed without logging a prediction.
+    """
+
+    answer_letter: Optional[str]
+    raw_output: Optional[str]
+    frame_indices: list[int]
+    failed_reason: Optional[str] = None
+
+
+def run_sample_oneshot(
+    sample: Any,
+    *,
+    dataset: Dataset,
+    backend: Backend,
+    cfg: LoopConfig,
+    stats: RunStats,
+    rng: random.Random,
+    base_url: str,
+    model_id: str,
+    run: Any = None,
+) -> OneshotOutcome:
+    """Single-round baseline: sample frames once, one chat, parse the answer.
+
+    Deliberately separate from the multi-round :func:`run_sample`. It reuses the
+    same Dataset/Backend adapter methods (frame_count / initial_frame_indices /
+    extract_frames / format_question / normalize_answer) plus the one-shot-only
+    ``oneshot_user_text``. No select/summarize/retry loop.
+    """
+    _ = run, rng
+
+    try:
+        frame_count = dataset.frame_count(sample)
+    except Exception:
+        return OneshotOutcome(
+            answer_letter=None, raw_output=None, frame_indices=[], failed_reason="invalid_video_timeline"
+        )
+    if frame_count <= 0:
+        return OneshotOutcome(
+            answer_letter=None, raw_output=None, frame_indices=[], failed_reason="invalid_video_timeline"
+        )
+
+    question_block = dataset.format_question(sample)
+    frame_indices = [int(i) for i in dataset.initial_frame_indices(sample, frame_count, cfg)]
+    images = dataset.extract_frames(sample, frame_indices)
+    if not images:
+        return OneshotOutcome(
+            answer_letter=None, raw_output=None, frame_indices=frame_indices, failed_reason="no_frames"
+        )
+
+    user_text = dataset.oneshot_user_text(question_block, len(images))
+    raw = backend.chat(
+        base_url=base_url,
+        model_id=model_id,
+        system_prompt="",
+        user_text=user_text,
+        images=images,
+        temperature=cfg.temperature,
+        top_p=cfg.top_p,
+        max_tokens=cfg.max_tokens,
+        timeout_s=cfg.request_timeout_s,
+    )
+    stats.total_model_calls += 1
+    answer_letter = dataset.normalize_answer(sample, raw)
+    return OneshotOutcome(
+        answer_letter=answer_letter,
+        raw_output=raw,
+        frame_indices=frame_indices,
+        failed_reason=None,
+    )
+
+
 _LOG_PREFIX_FIELDS = ("sample_id", "qid", "video_id", "video_path")
 _LOG_QUESTION_FIELDS = ("question", "choices", "ground_truth_idx")
 

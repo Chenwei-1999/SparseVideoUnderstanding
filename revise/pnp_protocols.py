@@ -52,6 +52,14 @@ class Dataset(Protocol):
 
     def extract_frames(self, sample: Any, indices: list[int]) -> list[Any]: ...
 
+    def oneshot_user_text(self, question_block: str, num_frames: int) -> str:
+        """Build the single-round (one-shot baseline) user prompt.
+
+        Used only by :func:`revise.pnp_engine.run_sample_oneshot`; the multi-round
+        loop uses :meth:`build_user_text` instead.
+        """
+        ...
+
     def sample_unseen_frames(
         self,
         frame_count: int,

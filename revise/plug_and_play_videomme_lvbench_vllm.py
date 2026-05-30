@@ -480,6 +480,20 @@ class _BaseLongVideoDataset:
     def extract_frames(self, sample: MCVideoSample, indices: list[int]) -> list[Image.Image]:
         return extract_frames_1fps(self._ensure_video_path(sample), indices)
 
+    def oneshot_user_text(self, question_block: str, num_frames: int) -> str:
+        # Single-round baseline prompt; kept byte-identical to the legacy
+        # ``oneshot_videomme_lvbench_vllm._build_user_text``.
+        lines: list[str] = []
+        lines.append(question_block)
+        lines.append("")
+        lines.append(f"You will be shown {num_frames} video frames sampled at 1 fps.")
+        lines.append("Answer with EXACTLY ONE option letter (e.g., A/B/C/D). Do not output any other text.")
+        lines.append("")
+        lines.append("Frames:")
+        for i in range(num_frames):
+            lines.append(f"Frame {i+1}: <image>")
+        return "\n".join(lines)
+
     def sample_unseen_frames(self, frame_count: int, seen: set[int], k: int, rng: random.Random) -> list[int]:
         if frame_count <= 0 or k <= 0:
             return []

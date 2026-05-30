@@ -16,12 +16,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from revise import pnp_harness
 from revise.plug_and_play_videomme_lvbench_vllm import (
+    LVBenchDataset,
+    VideoMMEDataset,
+    VllmHttpBackend,
     _chat_once,
     _load_lvbench_samples,
     _load_videomme_samples,
     _start_vllm_server,
 )
+from revise.pnp_protocols import LoopConfig, RunStats
 from revise.pnp_utils import (
     extract_frames_1fps as _extract_frames_1fps,
     extract_video_info as _extract_video_info,
@@ -207,125 +212,90 @@ def main() -> int:
     model_id = _get_model_id(base_url, model_id=args.model_id)
 
     rng = random.Random(1337 + int(args.shard_idx))
-    start_t = time.time()
 
-    correct = 0
-    failed = 0
-    total_calls = 0
-    printed_error = False
-
-    for i, sample in enumerate(samples, start=1):
-        video_path = str(cache_dir / sample.video_key)
-        if not os.path.exists(video_path) or os.path.getsize(video_path) <= 0:
-            failed += 1
-            continue
-
-        try:
-            total_frames, fps = _extract_video_info(video_path)
-            timeline_len = _timeline_len_1fps(total_frames, fps)
-        except Exception:
-            failed += 1
-            continue
-
-        if timeline_len <= 0:
-            failed += 1
-            continue
-
-        range_start, range_end = 0, timeline_len - 1
-        if args.dataset == "lvbench" and sample.time_reference:
-            tr = _parse_time_reference_range(sample.time_reference, timeline_len)
-            if tr is not None:
-                range_start, range_end = tr
-
-        frame_indices = _sample_uniform_indices_inclusive(range_start, range_end, int(args.max_frames))
-        images = _extract_frames_1fps(video_path, frame_indices)
-        if not images:
-            failed += 1
-            continue
-
-        if args.dataset == "videomme" and args.videomme_use_official_prompt:
-            question_block = _format_videomme_question_block(sample.question, sample.options)
-        else:
-            question_block = _format_question_block(sample.question, sample.options)
-        user_text = _build_user_text(question_block, len(images))
-        try:
-            out = _chat_once(
-                base_url=base_url,
-                model_id=model_id,
-                system_prompt="",
-                user_text=user_text,
-                images=images,
-                temperature=float(args.temperature),
-                top_p=float(args.top_p),
-                max_tokens=int(args.max_tokens),
-                timeout_s=int(args.timeout_s),
-            )
-            total_calls += 1
-        except Exception as e:
-            if not printed_error:
-                printed_error = True
-                print(f"[first_error] {type(e).__name__}: {e}", flush=True)
-            if args.restart_server_on_failure and args.start_server and server_proc is not None:
-                try:
-                    _stop_server(server_proc)
-                except Exception:
-                    pass
-                server_proc = _start_vllm_server(args)
-                _wait_for_server(args.host, args.port, timeout_s=args.server_timeout_s)
-                model_id = _get_model_id(base_url, model_id=args.model_id)
-                try:
-                    out = _chat_once(
-                        base_url=base_url,
-                        model_id=model_id,
-                        system_prompt="",
-                        user_text=user_text,
-                        images=images,
-                        temperature=float(args.temperature),
-                        top_p=float(args.top_p),
-                        max_tokens=int(args.max_tokens),
-                        timeout_s=int(args.timeout_s),
-                    )
-                    total_calls += 1
-                except Exception:
-                    failed += 1
-                    continue
-            else:
-                failed += 1
-                continue
-
-        pred = _normalize_answer_letter(out, len(sample.options))
-        gt = _normalize_answer_letter(sample.answer_letter, len(sample.options))
-        is_correct = pred is not None and gt is not None and pred == gt
-        if is_correct:
-            correct += 1
-
-        _maybe_log_jsonl(
-            args.log_jsonl,
-            {
-                "ts": time.time(),
-                "dataset": args.dataset,
-                "split": split,
-                "uid": sample.uid,
-                "video_key": sample.video_key,
-                "video_path": video_path,
-                "time_reference": sample.time_reference,
-                "sample_id": sample.sample_id,
-                "question": sample.question,
-                "options": sample.options,
-                "answer_gt": sample.answer_letter,
-                "pred_answer": pred,
-                "raw_output": out,
-                "correct": bool(is_correct),
-            },
+    # Build the shared Dataset adapter + Backend and delegate the single-round
+    # eval loop to the shared harness (setting="oneshot_baseline"). The adapter
+    # reuses extract_frames / initial_frame_indices / normalize_answer / the
+    # one-shot prompt; the harness owns video-existence skip, scoring, logging,
+    # and the launcher's own top-level summary schema.
+    dataset_adapter: Any
+    if args.dataset == "videomme":
+        dataset_adapter = VideoMMEDataset(
+            split=split,
+            video_cache_dir=args.video_cache_dir,
+            yt_dlp_timeout_s=600,
+            videomme_use_official_prompt=bool(args.videomme_use_official_prompt),
+        )
+    else:
+        dataset_adapter = LVBenchDataset(
+            split=split,
+            video_cache_dir=args.video_cache_dir,
+            yt_dlp_timeout_s=600,
+            videomme_use_official_prompt=bool(args.videomme_use_official_prompt),
         )
 
-        if i % 50 == 0:
-            answered = i - failed
-            acc = correct / max(1, answered)
-            print(
-                f"[{i}/{len(samples)}] acc={acc:.4f} failed={failed} calls={total_calls} elapsed_s={time.time()-start_t:.1f}",
-                flush=True,
-            )
+    cfg = LoopConfig(
+        max_rounds=1,
+        max_frames_per_round=int(args.max_frames),
+        temperature=float(args.temperature),
+        top_p=float(args.top_p),
+        max_tokens=int(args.max_tokens),
+        request_timeout_s=int(args.timeout_s),
+        max_retries_per_round=0,
+        strict_actions=False,
+        force_final_answer=False,
+        use_candidate_frames=False,
+        candidate_k=None,
+        use_candidate_frame_ids=False,
+        require_candidate_frames=False,
+        answer_only_final_round=False,
+        observation_mode="image",
+        caption_include="none",
+        caption_max_chars=0,
+        captions_dir=None,
+        hide_seen_frames_in_prompt=False,
+        log_jsonl=args.log_jsonl or None,
+        seed=1337 + int(args.shard_idx),
+    )
+
+    def _restart_server() -> Optional[str]:
+        nonlocal server_proc, model_id
+        if not (args.restart_server_on_failure and args.start_server and server_proc is not None):
+            raise RuntimeError("restart_not_configured")
+        try:
+            _stop_server(server_proc)
+        except Exception:
+            pass
+        server_proc = _start_vllm_server(args)
+        _wait_for_server(args.host, args.port, timeout_s=args.server_timeout_s)
+        model_id = _get_model_id(base_url, model_id=args.model_id)
+        return model_id
+
+    restart_enabled = bool(args.restart_server_on_failure and args.start_server)
+    backend = VllmHttpBackend(restart_server=None)
+
+    args._pnp_setting = "oneshot_baseline"
+    args._pnp_split = split
+    args._pnp_oneshot_cache_dir = cache_dir
+    args._pnp_oneshot_resume_completed = resume_completed
+    args._pnp_oneshot_cache_filter_total = cache_filter_total
+    args._pnp_oneshot_cache_filter_missing = cache_filter_missing
+    args._pnp_oneshot_cache_filter_missing_examples = cache_filter_missing_examples
+    args._pnp_oneshot_restart_server = _restart_server if restart_enabled else None
+
+    stats = RunStats()
+    results = pnp_harness.run_eval(
+        samples,
+        dataset=dataset_adapter,
+        backend=backend,
+        cfg=cfg,
+        stats=stats,
+        rng=rng,
+        base_url=base_url,
+        model_id=model_id,
+        run=None,
+        args=args,
+    )
 
     if args.start_server and server_proc is not None:
         try:
@@ -333,32 +303,10 @@ def main() -> int:
         except Exception:
             pass
 
-    total = len(samples) + resume_completed
-    answered = max(0, total - failed)
-    results = {
-        "samples": total,
-        "answered": answered,
-        "correct": correct,
-        "accuracy": float(correct / max(1, answered)),
-        "failed": failed,
-        "elapsed_s": float(time.time() - start_t),
-        "total_model_calls": total_calls,
-        "prompt_log_jsonl": args.log_jsonl,
-        "cached_only": bool(args.cached_only),
-        "allow_missing_cached_videos": bool(args.allow_missing_cached_videos),
-        "cache_filter_total_samples": cache_filter_total,
-        "cache_filter_missing_videos": cache_filter_missing,
-        "cache_filter_missing_examples": cache_filter_missing_examples,
-    }
-    payload = json.dumps(results, indent=2, ensure_ascii=False)
-    print(payload, flush=True)
-    if args.summary_json:
-        out_dir = os.path.dirname(args.summary_json)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        with open(args.summary_json, "w", encoding="utf-8") as f:
-            f.write(payload + "\n")
-    if total > 0 and (failed >= total or total_calls == 0):
+    total = int(results.get("samples", 0))
+    if total > 0 and (
+        int(results.get("failed", 0)) >= total or int(results.get("total_model_calls", 0)) == 0
+    ):
         return 2
     return 0
 

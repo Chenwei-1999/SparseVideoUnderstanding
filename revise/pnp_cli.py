@@ -32,7 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified REVISE plug-and-play evaluator.")
     parser.add_argument("--dataset", choices=DATASET_NAMES, required=True)
     parser.add_argument("--backend", choices=BACKEND_NAMES, required=True)
-    parser.add_argument("--setting", default="multi_round_pnp", choices=["multi_round_pnp"])
+    parser.add_argument(
+        "--setting",
+        default="multi_round_pnp",
+        choices=["multi_round_pnp", "oneshot_baseline"],
+    )
 
     parser.add_argument("--model-path", default="")
     parser.add_argument("--video-root", default=None)
@@ -243,12 +247,29 @@ def _build_loop_config(args: argparse.Namespace) -> LoopConfig:
     )
 
 
+def _prepare_oneshot_metadata(args: argparse.Namespace, split: str) -> None:
+    """Wire the single-round baseline harness path for videomme/lvbench."""
+    from pathlib import Path
+
+    args._pnp_setting = "oneshot_baseline"
+    args._pnp_split = split
+    args._pnp_oneshot_cache_dir = Path(args.video_cache_dir) / str(args.dataset).lower()
+    args._pnp_oneshot_resume_completed = 0
+    args._pnp_oneshot_cache_filter_total = 0
+    args._pnp_oneshot_cache_filter_missing = 0
+    args._pnp_oneshot_cache_filter_missing_examples = []
+    args._pnp_oneshot_restart_server = None
+
+
 def _prepare_harness_metadata(args: argparse.Namespace, split: str, max_len: int | None = None) -> None:
     dataset_name = str(args.dataset).lower()
     args._pnp_maybe_init_wandb = maybe_init_wandb
     args._pnp_wandb_log = wandb_log
     args._pnp_split = split
     args._pnp_max_len = max_len
+    if getattr(args, "setting", "multi_round_pnp") == "oneshot_baseline":
+        _prepare_oneshot_metadata(args, split)
+        return
     if dataset_name == "nextqa":
         args._pnp_harness_mode = "nextqa"
         args._pnp_run_config = {
@@ -311,6 +332,13 @@ def main(argv: list[str] | None = None) -> int | None:
         raise ValueError("--backend hf_inprocess is currently supported with --dataset lvbench_hf.")
     if args.backend == "vllm_http" and args.dataset == "lvbench_hf":
         raise ValueError("--dataset lvbench_hf requires --backend hf_inprocess.")
+    if args.setting == "oneshot_baseline" and (
+        args.dataset not in {"videomme", "lvbench"} or args.backend != "vllm_http"
+    ):
+        raise ValueError(
+            "--setting oneshot_baseline is supported only with "
+            "--dataset {videomme,lvbench} and --backend vllm_http."
+        )
     if args.base_url and args.start_server:
         raise ValueError("--base-url cannot be combined with --start-server.")
     if args.port <= 0:

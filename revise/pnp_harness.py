@@ -836,6 +836,148 @@ def _run_lvbench_hf(
     return summary
 
 
+def _run_oneshot(
+    samples: list[Any],
+    *,
+    dataset: Dataset,
+    backend: Backend,
+    cfg: LoopConfig,
+    stats: RunStats,
+    rng: Any,
+    base_url: str,
+    model_id: str,
+    run: Any,
+    args: Any,
+) -> dict[str, Any]:
+    """Single-round baseline outer loop (oneshot_videomme_lvbench_vllm).
+
+    Reproduces the legacy standalone launcher byte-for-byte: video-existence
+    skip (never downloads), one chat per sample via
+    :func:`pnp_engine.run_sample_oneshot`, and the launcher's own top-level
+    summary-json schema (NOT nested under ``results``).
+    """
+    _ = run
+    cache_dir = getattr(args, "_pnp_oneshot_cache_dir")
+    split = getattr(args, "_pnp_split", getattr(args, "split", ""))
+    resume_completed = int(getattr(args, "_pnp_oneshot_resume_completed", 0) or 0)
+    restart_cb = getattr(args, "_pnp_oneshot_restart_server", None)
+
+    start_t = time.time()
+    correct = 0
+    failed = 0
+    printed_error = False
+
+    for i, sample in enumerate(samples, start=1):
+        video_path = str(cache_dir / sample.video_key)
+        if not os.path.exists(video_path) or os.path.getsize(video_path) <= 0:
+            failed += 1
+            continue
+
+        try:
+            outcome = pnp_engine.run_sample_oneshot(
+                sample,
+                dataset=dataset,
+                backend=backend,
+                cfg=cfg,
+                stats=stats,
+                rng=rng,
+                base_url=base_url,
+                model_id=model_id,
+                run=run,
+            )
+        except Exception as e:
+            if not printed_error:
+                printed_error = True
+                print(f"[first_error] {type(e).__name__}: {e}", flush=True)
+            if restart_cb is not None:
+                new_model_id = restart_cb()
+                if new_model_id:
+                    model_id = new_model_id
+                try:
+                    outcome = pnp_engine.run_sample_oneshot(
+                        sample,
+                        dataset=dataset,
+                        backend=backend,
+                        cfg=cfg,
+                        stats=stats,
+                        rng=rng,
+                        base_url=base_url,
+                        model_id=model_id,
+                        run=run,
+                    )
+                except Exception:
+                    failed += 1
+                    continue
+            else:
+                failed += 1
+                continue
+
+        if outcome.failed_reason is not None:
+            failed += 1
+            continue
+
+        pred = outcome.answer_letter
+        is_correct = pred is not None and dataset.is_correct(sample, pred)
+        if is_correct:
+            correct += 1
+
+        maybe_log_jsonl(
+            args.log_jsonl,
+            {
+                "ts": time.time(),
+                "dataset": sample.dataset,
+                "split": split,
+                "uid": sample.uid,
+                "video_key": sample.video_key,
+                "video_path": video_path,
+                "time_reference": sample.time_reference,
+                "sample_id": sample.sample_id,
+                "question": sample.question,
+                "options": sample.options,
+                "answer_gt": sample.answer_letter,
+                "pred_answer": pred,
+                "raw_output": outcome.raw_output,
+                "correct": bool(is_correct),
+            },
+        )
+
+        if i % 50 == 0:
+            answered = i - failed
+            acc = correct / max(1, answered)
+            print(
+                f"[{i}/{len(samples)}] acc={acc:.4f} failed={failed} calls={stats.total_model_calls} "
+                f"elapsed_s={time.time()-start_t:.1f}",
+                flush=True,
+            )
+
+    total = len(samples) + resume_completed
+    answered = max(0, total - failed)
+    results = {
+        "samples": total,
+        "answered": answered,
+        "correct": correct,
+        "accuracy": float(correct / max(1, answered)),
+        "failed": failed,
+        "elapsed_s": float(time.time() - start_t),
+        "total_model_calls": stats.total_model_calls,
+        "prompt_log_jsonl": args.log_jsonl,
+        "cached_only": bool(getattr(args, "cached_only", False)),
+        "allow_missing_cached_videos": bool(getattr(args, "allow_missing_cached_videos", False)),
+        "cache_filter_total_samples": int(getattr(args, "_pnp_oneshot_cache_filter_total", 0)),
+        "cache_filter_missing_videos": int(getattr(args, "_pnp_oneshot_cache_filter_missing", 0)),
+        "cache_filter_missing_examples": list(getattr(args, "_pnp_oneshot_cache_filter_missing_examples", []) or []),
+    }
+    payload = json.dumps(results, indent=2, ensure_ascii=False)
+    print(payload, flush=True)
+    if args.summary_json:
+        out_dir = os.path.dirname(args.summary_json)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(args.summary_json, "w", encoding="utf-8") as f:
+            f.write(payload + "\n")
+    return results
+
+
 def run_eval(
     samples: list[Any],
     *,
@@ -850,6 +992,20 @@ def run_eval(
     args: Any,
 ) -> dict[str, Any]:
     """Run the legacy-compatible outer eval loop for a migrated PnP launcher."""
+    setting = getattr(args, "_pnp_setting", "multi_round_pnp")
+    if setting == "oneshot_baseline":
+        return _run_oneshot(
+            samples,
+            dataset=dataset,
+            backend=backend,
+            cfg=cfg,
+            stats=stats,
+            rng=rng,
+            base_url=base_url,
+            model_id=model_id,
+            run=run,
+            args=args,
+        )
     mode = getattr(args, "_pnp_harness_mode", getattr(dataset, "harness_mode", "nextqa"))
     if mode == "nextqa":
         return _run_nextqa(
