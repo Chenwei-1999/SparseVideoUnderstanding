@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = REPO_ROOT / "scripts" / "repro" / "verl_divergence.py"
+SCRIPT = REPO_ROOT / "scripts" / "verl_divergence.py"
 
 
 def _write(path: Path, content: str) -> None:
