@@ -76,6 +76,7 @@ from revise.pnp_utils import (
     stable_sample_id_nextqa,
     build_vllm_serve_command,
     open_server_log_streams,
+    retry_feedback_text,
     stop_server,
     summary_has_ohrpu,
     truncate_text,
@@ -353,14 +354,15 @@ def _sample_unseen_frames(frame_count: int, seen: set[int], k: int, rng: random.
 
 
 def _retry_feedback_text(feedback: str, *, force_answer: bool = False) -> str:
-    if force_answer:
-        return (
-            f"{feedback}\n"
+    return retry_feedback_text(
+        feedback,
+        force_answer=force_answer,
+        force_instructions=(
             "Output ONLY <think>...</think> then <answer>LETTER</answer>. "
             "In <summarize>, include P/O/H/U/R in that exact order. "
             "In <answer>, LETTER must be a single option letter (e.g., A/B/C/D/E)."
-        )
-    return f"{feedback}\nPlease respond with one of the required formats."
+        ),
+    )
 
 
 def _load_progress_from_log(

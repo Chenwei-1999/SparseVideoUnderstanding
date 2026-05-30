@@ -201,6 +201,11 @@ def _load_nextqa_samples(
 
 
 def _start_vllm_server(args: argparse.Namespace) -> subprocess.Popen[str]:
+    # NOTE: deliberately *not* using pnp_utils.build_vllm_serve_command. Caption
+    # generation streams many frames in a single prompt, so this launcher omits
+    # --limit-mm-per-prompt (an image cap would break it) and does not pass
+    # --served-model-name. Those omissions are load-bearing, so the command is
+    # kept inline rather than folded into the shared (image-capped) builder.
     env = os.environ.copy()
     env.pop("ROCR_VISIBLE_DEVICES", None)
     env.pop("HIP_VISIBLE_DEVICES", None)

@@ -157,6 +157,18 @@ def truncate_text(text: str, max_chars: int) -> str:
     return text[:max_chars].rstrip() + "…"
 
 
+def retry_feedback_text(feedback: str, *, force_answer: bool, force_instructions: str) -> str:
+    """Build the retry nudge appended after an unparseable model turn.
+
+    The non-forced branch ("respond with one of the required formats") is
+    identical across callers; the forced branch differs per benchmark and is
+    passed in via *force_instructions* so it stays visible at the call site.
+    """
+    if force_answer:
+        return f"{feedback}\n{force_instructions}"
+    return f"{feedback}\nPlease respond with one of the required formats."
+
+
 def _contains_auto_map(value: Any) -> bool:
     if isinstance(value, dict):
         if "auto_map" in value:

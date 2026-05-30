@@ -22,11 +22,15 @@ Design notes:
   (doing so would shift which frames each benchmark sees -> different numbers).
 """
 
+import os
 import random
+import subprocess
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import revise.pnp_utils as pnp_utils
 import revise.plug_and_play_nextqa_vllm as nextqa
 import revise.plug_and_play_egoschema_vllm as egoschema
 import revise.plug_and_play_videomme_lvbench_vllm as videomme
@@ -146,6 +150,28 @@ class StartVllmServerTest(unittest.TestCase):
         # Qwen2.5-VL path does not trigger trust-remote-code.
         cmd, _ = self._capture(nextqa, _launcher_args())
         self.assertNotIn("--trust-remote-code", cmd)
+
+
+class OpenServerLogStreamsTest(unittest.TestCase):
+    """Cover the launcher's log-redirection branch (the launcher tests use None)."""
+
+    def test_none_returns_devnull_for_both_streams(self):
+        out, err = pnp_utils.open_server_log_streams(None)
+        self.assertIs(out, subprocess.DEVNULL)
+        self.assertIs(err, subprocess.DEVNULL)
+
+    def test_path_opens_appendable_log_and_creates_parent_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            log_path = os.path.join(d, "nested", "server.log")
+            out, err = pnp_utils.open_server_log_streams(log_path)
+            try:
+                self.assertIs(out, err)  # single shared handle for stdout+stderr
+                self.assertEqual(out.mode, "a")
+                self.assertTrue(os.path.isdir(os.path.join(d, "nested")))
+                out.write("x")
+            finally:
+                out.close()
+            self.assertTrue(os.path.exists(log_path))
 
 
 class LoaderDivergenceTest(unittest.TestCase):

@@ -74,6 +74,7 @@ from revise.pnp_utils import (
     stable_sample_id_dataset,
     build_vllm_serve_command,
     open_server_log_streams,
+    retry_feedback_text,
     stop_server,
     timeline_len_1fps,
     wait_for_server,
@@ -109,12 +110,11 @@ def _bare_answer_after_summary(raw_output: str) -> Optional[str]:
 
 
 def _retry_feedback_text(feedback: str, *, force_answer: bool) -> str:
-    if force_answer:
-        return (
-            f"{feedback}\n"
-            "You MUST answer now. Output <think>...</think> then <answer>LETTER</answer>."
-        )
-    return f"{feedback}\nPlease respond with one of the required formats."
+    return retry_feedback_text(
+        feedback,
+        force_answer=force_answer,
+        force_instructions="You MUST answer now. Output <think>...</think> then <answer>LETTER</answer>.",
+    )
 
 
 def _start_vllm_server(args: argparse.Namespace) -> subprocess.Popen[str]:

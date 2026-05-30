@@ -61,6 +61,7 @@ from revise.pnp_utils import (
     parse_options_from_lvbench_question,
     parse_time_reference_range,
     propose_candidate_frames,
+    retry_feedback_text,
     sample_uniform_indices_inclusive,
     shard_by_video,
     stable_sample_id_dataset,
@@ -239,12 +240,11 @@ def _chat_once_hf(
 
 
 def _retry_feedback_text(feedback: str, *, force_answer: bool) -> str:
-    if force_answer:
-        return (
-            f"{feedback}\n"
-            "You MUST answer now. Output <think>...</think> then <answer>LETTER</answer>."
-        )
-    return f"{feedback}\nPlease respond with one of the required formats."
+    return retry_feedback_text(
+        feedback,
+        force_answer=force_answer,
+        force_instructions="You MUST answer now. Output <think>...</think> then <answer>LETTER</answer>.",
+    )
 
 
 @dataclass
