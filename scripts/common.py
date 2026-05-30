@@ -52,21 +52,77 @@ def _run(cmd: list[str]) -> tuple[int, str]:
     return proc.returncode, output
 
 
+_PROBE_ROW_LIMIT = 32
+
+
+def _read_json_array_prefix(path: str, limit: int) -> tuple[list[Any], bool]:
+    """Parse up to *limit* elements from the front of a JSON-array file.
+
+    The VideoEspresso annotation files are hundreds of megabytes, but the MC
+    probe below only needs the first few rows. Loading the whole file with
+    ``json.loads(read_text())`` costs roughly 3x its size in RAM (a multi-hundred
+    MB file can balloon the process past a gigabyte) plus seconds of GPFS I/O.
+    This reads the file incrementally with ``raw_decode`` and stops as soon as
+    *limit* elements have been decoded, leaving the rest of the file unread (and
+    tolerating a truncated/corrupt tail beyond the prefix).
+
+    Returns ``(items, is_array)`` where ``is_array`` is True iff the first
+    non-whitespace character is ``[``.
+    """
+    decoder = json.JSONDecoder()
+    items: list[Any] = []
+    buf = ""
+    started = False
+    with open(path, "r", encoding="utf-8") as f:
+        while len(items) < limit:
+            if not started:
+                stripped = buf.lstrip()
+                if not stripped:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        return items, False
+                    buf = chunk
+                    continue
+                if stripped[0] != "[":
+                    return items, False
+                buf = stripped[1:]
+                started = True
+            buf = buf.lstrip().lstrip(",").lstrip()
+            if buf[:1] == "]":
+                return items, True
+            if not buf:
+                chunk = f.read(65536)
+                if not chunk:
+                    return items, True
+                buf += chunk
+                continue
+            try:
+                obj, end = decoder.raw_decode(buf)
+            except json.JSONDecodeError:
+                chunk = f.read(65536)
+                if not chunk:
+                    return items, True
+                buf += chunk
+                continue
+            items.append(obj)
+            buf = buf[end:]
+    return items, True
+
+
 def _probe_videoespresso_mc(json_path: str | None) -> dict[str, Any]:
     out = {"path": json_path, "multiple_choice": False, "reason": "missing"}
     if not json_path or not Path(json_path).exists():
         return out
     try:
-        data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+        rows, is_array = _read_json_array_prefix(json_path, _PROBE_ROW_LIMIT)
     except Exception as exc:
         out["reason"] = f"json_error: {type(exc).__name__}"
         return out
-    if not isinstance(data, list) or not data:
+    if not is_array or not rows:
         out["reason"] = "empty_or_non_list"
         return out
-    probe = data[: min(32, len(data))]
     has_mc = True
-    for row in probe:
+    for row in rows:
         if not isinstance(row, dict):
             has_mc = False
             break
