@@ -91,7 +91,8 @@ from revise.pnp_utils import (
     propose_candidate_frames,
     resolve_base_url,
     sample_uniform_indices,
-    should_trust_remote_code,
+    build_vllm_serve_command,
+    open_server_log_streams,
     stop_server,
     summary_has_ohrpu,
     unseen_intervals,
@@ -258,49 +259,12 @@ def _call_chat_completions(
 
 
 def _start_vllm_server(args: argparse.Namespace) -> subprocess.Popen[str]:
-    env = os.environ.copy()
-    env.pop("ROCR_VISIBLE_DEVICES", None)
-    env.pop("HIP_VISIBLE_DEVICES", None)
-    env["CUDA_VISIBLE_DEVICES"] = env.get("CUDA_VISIBLE_DEVICES", "0,1,2,3")
-
-    py_bin = os.path.dirname(sys.executable)
-    if py_bin:
-        env["PATH"] = py_bin + os.pathsep + env.get("PATH", "")
-    vllm_bin = shutil.which("vllm", path=env.get("PATH"))
-
-    cmd = [
-        vllm_bin or "vllm",
-        "serve",
-        args.model_path,
-        "--host",
-        args.host,
-        "--port",
-        str(args.port),
-        "--dtype",
-        args.dtype,
-        "--load-format",
-        "auto",
-        "--max-model-len",
-        str(args.max_model_len),
-        "--tensor-parallel-size",
-        str(args.tensor_parallel_size),
-        "--gpu-memory-utilization",
-        str(args.gpu_memory_utilization),
-        "--limit-mm-per-prompt",
-        json.dumps({"image": int(args.max_frames_per_round)}),
-    ]
-    if getattr(args, "model_id", None):
-        cmd += ["--served-model-name", str(args.model_id)]
-    if should_trust_remote_code(str(args.model_path)):
-        cmd += ["--trust-remote-code"]
-
-    server_stdout: Any = subprocess.DEVNULL
-    server_stderr: Any = subprocess.DEVNULL
-    if args.server_log:
-        os.makedirs(os.path.dirname(args.server_log) or ".", exist_ok=True)
-        log_f = open(args.server_log, "a", encoding="utf-8")
-        server_stdout = log_f
-        server_stderr = log_f
+    cmd, env = build_vllm_serve_command(
+        args,
+        image_limit=int(args.max_frames_per_round),
+        cuda_visible_default="0,1,2,3",
+    )
+    server_stdout, server_stderr = open_server_log_streams(args.server_log)
     return subprocess.Popen(cmd, env=env, stdout=server_stdout, stderr=server_stderr)
 
 

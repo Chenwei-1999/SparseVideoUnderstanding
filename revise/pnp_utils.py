@@ -18,8 +18,10 @@ import math
 import os
 import random
 import re
+import shutil
 import socket
 import subprocess
+import sys
 import time
 from typing import Any, Optional
 
@@ -999,6 +1001,82 @@ def get_model_id(base_url: str, timeout: int = 30, model_id: str | None = None) 
     if not models:
         raise RuntimeError(f"No models returned from {base_url}/v1/models")
     return models[0]["id"]
+
+
+def build_vllm_serve_command(
+    args: argparse.Namespace,
+    *,
+    image_limit: int,
+    cuda_visible_default: str = "0",
+) -> tuple[list[str], dict[str, str]]:
+    """Build the ``vllm serve`` argv and process environment for a launcher.
+
+    This is the shared specification of how the plug-and-play scripts start their
+    vLLM server. It is a *pure* function (no spawning, no I/O) so the spawn itself
+    stays in the caller and can be mocked there; that also makes the command
+    directly testable.
+
+    The two things that legitimately differ between callers are surfaced as
+    explicit arguments rather than being buried in three near-identical copies:
+
+    * ``image_limit`` -- the ``--limit-mm-per-prompt`` image cap. NExTQA passes
+      ``max(max_frames_per_round, caption_gen_max_frames)`` (it also samples
+      caption frames); the others pass ``max_frames_per_round``.
+    * ``cuda_visible_default`` -- the ``CUDA_VISIBLE_DEVICES`` fallback used only
+      when the variable is not already set in the environment.
+    """
+    env = os.environ.copy()
+    env.pop("ROCR_VISIBLE_DEVICES", None)
+    env.pop("HIP_VISIBLE_DEVICES", None)
+    env["CUDA_VISIBLE_DEVICES"] = env.get("CUDA_VISIBLE_DEVICES", cuda_visible_default)
+
+    # Prefer a vLLM binary from the active Python environment.
+    py_bin = os.path.dirname(sys.executable)
+    if py_bin:
+        env["PATH"] = py_bin + os.pathsep + env.get("PATH", "")
+    vllm_bin = shutil.which("vllm", path=env.get("PATH"))
+
+    cmd = [
+        vllm_bin or "vllm",
+        "serve",
+        args.model_path,
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--dtype",
+        args.dtype,
+        "--load-format",
+        "auto",
+        "--max-model-len",
+        str(args.max_model_len),
+        "--tensor-parallel-size",
+        str(args.tensor_parallel_size),
+        "--gpu-memory-utilization",
+        str(args.gpu_memory_utilization),
+        "--limit-mm-per-prompt",
+        json.dumps({"image": int(image_limit)}),
+    ]
+    if getattr(args, "model_id", None):
+        cmd += ["--served-model-name", str(args.model_id)]
+    if should_trust_remote_code(str(args.model_path)):
+        cmd += ["--trust-remote-code"]
+    return cmd, env
+
+
+def open_server_log_streams(server_log: str | None) -> tuple[Any, Any]:
+    """Resolve (stdout, stderr) targets for a launched server.
+
+    Returns ``DEVNULL`` for both when no log path is given, otherwise an appended
+    log file (creating its parent directory) used for both streams.
+    """
+    if not server_log:
+        return subprocess.DEVNULL, subprocess.DEVNULL
+    log_dir = os.path.dirname(server_log)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    log_f = open(server_log, "a", encoding="utf-8")
+    return log_f, log_f
 
 
 def stop_server(proc: subprocess.Popen) -> None:

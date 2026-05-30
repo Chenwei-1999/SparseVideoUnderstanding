@@ -51,8 +51,9 @@ from revise.pnp_utils import (
     resolve_base_url,
     sample_uniform_indices_inclusive,
     shard_by_video,
-    should_trust_remote_code,
     stable_sample_id_dataset,
+    build_vllm_serve_command,
+    open_server_log_streams,
     stop_server,
     timeline_len_1fps,
     wait_for_server,
@@ -97,49 +98,12 @@ def _retry_feedback_text(feedback: str, *, force_answer: bool) -> str:
 
 
 def _start_vllm_server(args: argparse.Namespace) -> subprocess.Popen[str]:
-    env = os.environ.copy()
-    env.pop("ROCR_VISIBLE_DEVICES", None)
-    env.pop("HIP_VISIBLE_DEVICES", None)
-    env["CUDA_VISIBLE_DEVICES"] = env.get("CUDA_VISIBLE_DEVICES", "0")
-
-    py_bin = os.path.dirname(sys.executable)
-    if py_bin:
-        env["PATH"] = py_bin + os.pathsep + env.get("PATH", "")
-    vllm_bin = shutil.which("vllm", path=env.get("PATH"))
-    cmd = [
-        vllm_bin or "vllm",
-        "serve",
-        args.model_path,
-        "--host",
-        args.host,
-        "--port",
-        str(args.port),
-        "--dtype",
-        args.dtype,
-        "--load-format",
-        "auto",
-        "--max-model-len",
-        str(args.max_model_len),
-        "--tensor-parallel-size",
-        str(args.tensor_parallel_size),
-        "--gpu-memory-utilization",
-        str(args.gpu_memory_utilization),
-        "--limit-mm-per-prompt",
-        json.dumps({"image": int(args.max_frames_per_round)}),
-    ]
-    if getattr(args, "model_id", None):
-        cmd += ["--served-model-name", str(args.model_id)]
-    if should_trust_remote_code(str(args.model_path)):
-        cmd += ["--trust-remote-code"]
-    stdout = subprocess.DEVNULL
-    stderr = subprocess.DEVNULL
-    if args.server_log:
-        log_dir = os.path.dirname(args.server_log)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-        log_f = open(args.server_log, "a", encoding="utf-8")
-        stdout = log_f
-        stderr = log_f
+    cmd, env = build_vllm_serve_command(
+        args,
+        image_limit=int(args.max_frames_per_round),
+        cuda_visible_default="0",
+    )
+    stdout, stderr = open_server_log_streams(args.server_log)
     return subprocess.Popen(cmd, env=env, stdout=stdout, stderr=stderr)
 
 
