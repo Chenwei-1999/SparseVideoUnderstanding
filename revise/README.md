@@ -9,6 +9,28 @@ python scripts/doctor.py
 python scripts/paper_suite.py check --all
 ```
 
+## Pipeline map
+
+Each benchmark has one self-contained plug-and-play script implementing the
+REVISE multi-round loop (`<think>` → `<summarize>` P/O/H/U/R state →
+`<select>` new frames / `<answer>`). They are CLI executables, driven by the
+`run_*.sh` wrappers and orchestrated as subprocesses by `scripts/paper_suite.py`.
+
+| Script | Benchmark(s) | Backend | Driven by |
+|---|---|---|---|
+| `plug_and_play_nextqa_vllm.py` | NExT-QA (+ SFT teacher data) | vLLM server | `run_generate_teacher_data.sh`, `paper_suite.py` |
+| `plug_and_play_egoschema_vllm.py` | EgoSchema, VideoEspresso | vLLM server | `run_generate_teacher_data_videoespresso.sh`, `paper_suite.py` |
+| `plug_and_play_videomme_lvbench_vllm.py` | Video-MME, LVBench | vLLM server | `paper_suite.py` |
+| `plug_and_play_lvbench_hf.py` | Video-MME, LVBench | in-process HF `transformers` | `paper_suite.py` |
+
+Shared code lives in `pnp_utils.py` (frame extraction, tag parsing, the vLLM
+launch command, server lifecycle) and `pnp_prompts.py` (system prompts). The
+two `videomme_lvbench` scripts keep separate `MCVideoSample`/loaders on purpose
+— their row-filtering and fields differ per backend. The behavior of the
+shared launch and frame-sampling helpers is pinned by
+`tests/test_pnp_characterization.py` (run with
+`python -m unittest tests.test_pnp_characterization`).
+
 ## Data
 - Default ignored asset root: `$PWD/data/revise_assets`
 - NExT-QA root: `REVISE_NEXTQA_ROOT`

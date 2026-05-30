@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+"""REVISE multi-round plug-and-play evaluation for EgoSchema / VideoEspresso (vLLM).
+
+Runs the REVISE question-aware sparse-video loop against a vLLM
+OpenAI-compatible server for EgoSchema (and the VideoEspresso multiple-choice
+split, which shares this loader and loop). Each round the model reasons in
+``<think>``, emits a ``<summarize>`` P/O/H/U/R state, then either ``<select>``s
+previously unseen frames or commits an ``<answer>``; a final answer is
+force-requested once ``--max-rounds`` is reached.
+
+Includes component-ablation switches (e.g. omitting the carried summary state,
+or accepting an unstructured summary) used by the paper's ablations. Run as a
+CLI (see ``main``); invoked by ``run_generate_teacher_data_videoespresso.sh``
+and ``scripts/paper_suite.py``. Shared helpers live in ``revise/pnp_utils.py``.
+"""
 
 from __future__ import annotations
 

@@ -1,4 +1,24 @@
 #!/usr/bin/env python3
+"""REVISE multi-round plug-and-play evaluation for Video-MME / LVBench (vLLM).
+
+Runs the REVISE question-aware sparse-video loop against a vLLM
+OpenAI-compatible server for the two long-video multiple-choice benchmarks
+Video-MME and LVBench (selected via CLI flags). Each round the model reasons in
+``<think>``, emits a ``<summarize>`` P/O/H/U/R state, then either ``<select>``s
+unseen frames or commits an ``<answer>``; ``_bare_answer_after_summary`` also
+recovers a trailing bare letter when no frame request follows the summary.
+
+Frame indexing is 1-fps timeline based (these are long videos). Run as a CLI
+(see ``main``); invoked by ``scripts/paper_suite.py`` and imported for cache
+coverage checks by ``scripts/check_video_cache_coverage.py`` and
+``scripts/cache_hf_video_benchmark.py``. Shared helpers: ``revise/pnp_utils.py``.
+
+NOTE: this file's ``MCVideoSample`` / loaders intentionally differ from the
+HF-backend variant in ``plug_and_play_lvbench_hf.py`` (this one keeps every row
+and records a ``video_url``; the HF one filters empty answers and carries
+``question_type``/``video_type``). They are deliberately not unified -- see
+``tests/test_pnp_characterization.py::LoaderDivergenceTest``.
+"""
 
 from __future__ import annotations
 

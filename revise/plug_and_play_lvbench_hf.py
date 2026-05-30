@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""REVISE multi-round plug-and-play evaluation for Video-MME / LVBench (HF backend).
+
+In-process HuggingFace ``transformers`` variant of the Video-MME / LVBench
+pipeline: instead of talking to a vLLM server it loads the model and processor
+directly (with a LLaVA-OneVision/Qwen routing path via
+``revise/llava_next_runtime.py``) and runs the same REVISE multi-round loop
+(``<think>`` -> ``<summarize>`` P/O/H/U/R -> ``<select>``/``<answer>``).
+
+Use this backend for checkpoints that lack a vLLM serving path. Run as a CLI
+(see ``main``); invoked by ``scripts/paper_suite.py``. Shared helpers live in
+``revise/pnp_utils.py``.
+
+NOTE: ``MCVideoSample`` / loaders here intentionally differ from the vLLM
+variant in ``plug_and_play_videomme_lvbench_vllm.py`` (this one filters rows with
+an empty answer and carries ``question_type``/``video_type`` rather than a
+``video_url``). Deliberately not unified -- see
+``tests/test_pnp_characterization.py::LoaderDivergenceTest``.
+"""
 
 from __future__ import annotations
 

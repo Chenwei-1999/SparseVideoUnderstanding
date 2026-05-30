@@ -1,4 +1,23 @@
 #!/usr/bin/env python3
+"""REVISE multi-round plug-and-play evaluation for NExT-QA (vLLM backend).
+
+Runs the REVISE question-aware sparse-video loop against a vLLM
+OpenAI-compatible server. For each multiple-choice question the model iterates,
+per round:
+
+    <think> reason  ->  <summarize> P/O/H/U/R state  ->  <select> new frames
+                                                       (or <answer> LETTER)
+
+It starts from a uniform set of frames; each round it may request previously
+unseen frames. The loop ends when the model answers or ``--max-rounds`` is
+reached (a final answer is force-requested once the round budget is exhausted).
+The same entry point also generates SFT teacher data.
+
+Run as a CLI (see ``main``); invoked by ``run_generate_teacher_data.sh`` and
+``scripts/paper_suite.py``. Shared helpers live in ``revise/pnp_utils.py`` and
+prompts in ``revise/pnp_prompts.py``; the launch/sampling helpers are pinned by
+``tests/test_pnp_characterization.py``.
+"""
 
 from __future__ import annotations
 
