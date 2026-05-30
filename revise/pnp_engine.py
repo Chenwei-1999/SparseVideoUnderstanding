@@ -74,13 +74,7 @@ def run_sample(
     if getattr(cfg, "captions_dir", None) and getattr(cfg, "caption_include", "none") != "none":
         video_captions = dataset.load_video_captions(str(cfg.captions_dir), video_id)
 
-    summary_state = (
-        "P: I will summarize what has been shown so far; "
-        "O: I will record the key observations from the current evidence; "
-        "H: I will update my belief as new evidence arrives; "
-        "U: some key detail may still be unclear; "
-        "R: request more evidence if needed"
-    )
+    summary_state = dataset.initial_summary(cfg)
     effective_rounds = 0
     terminated_reason: Optional[str] = None
     terminated_invalid_action = False
@@ -164,6 +158,8 @@ def run_sample(
         images: list[Any] = []
         if observation_mode != "caption":
             images = dataset.extract_frames(sample, frames_this_round)
+            if dataset.should_fail_on_empty_images(cfg) and not images:
+                raise RuntimeError("No frames extracted for image-mode sample.")
         user_text = dataset.build_user_text(
             question_block=question_block,
             summary=summary_state,
@@ -182,10 +178,9 @@ def run_sample(
             candidate_id_ts=candidate_ts,
         )
         if cfg.force_final_answer and round_idx >= cfg.max_rounds:
-            user_text = (
-                f"{user_text}\n\n"
-                "This is the final round. You MUST answer now using <think>...</think> then <answer>LETTER</answer>."
-            )
+            final_round_instruction = dataset.final_round_instruction(cfg)
+            if final_round_instruction:
+                user_text = f"{user_text}\n\n{final_round_instruction}"
         last_user_text = user_text
         last_images = images
         last_frames = frames_this_round
@@ -392,6 +387,11 @@ def run_sample(
                     )
                     attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                     continue
+                if cfg.strict_actions and dataset.should_terminate_on_invalid_summary(cfg):
+                    stats.invalid_action_terminated += 1
+                    terminated_invalid_action = True
+                    answer_letter = None
+                    break
             if dataset.is_summary_stale(summary, seen_count=len(seen_frames)):
                 stats.invalid_outputs += 1
                 terminated_reason = "stale_select_summary"
@@ -406,6 +406,11 @@ def run_sample(
                     )
                     attempt_user_text = f"{user_text}\n\n{retry_feedback}"
                     continue
+                if cfg.strict_actions and dataset.should_terminate_on_invalid_summary(cfg):
+                    stats.invalid_action_terminated += 1
+                    terminated_invalid_action = True
+                    answer_letter = None
+                    break
 
             if (not bool(cfg.use_candidate_frame_ids)) and dataset.select_has_range_syntax(frames_text):
                 stats.invalid_outputs += 1
@@ -547,16 +552,21 @@ def run_sample(
         and last_user_text is not None
         and not (cfg.strict_actions and terminated_invalid_action)
     ):
-        forced_user_text = (
-            f"{last_user_text}\n\n"
-            "Max rounds reached. Provide the final answer now using <think>...</think> then <answer>LETTER</answer>."
+        forced_system_prompt, forced_user_text, forced_images = dataset.forced_answer_request(
+            sample,
+            question_block=question_block,
+            frame_count=frame_count,
+            max_rounds=cfg.max_rounds,
+            system_prompt=system_prompt,
+            last_user_text=last_user_text,
+            last_images=last_images,
         )
         raw = backend.chat(
             base_url=base_url,
             model_id=model_id,
-            system_prompt=system_prompt,
+            system_prompt=forced_system_prompt,
             user_text=forced_user_text,
-            images=last_images,
+            images=forced_images,
             temperature=cfg.temperature,
             top_p=cfg.top_p,
             max_tokens=cfg.max_tokens,
@@ -575,7 +585,7 @@ def run_sample(
                 "seen_frames": seen_frames,
                 "current_frames": last_frames,
                 "summary_in": summary_state,
-                "system_prompt": system_prompt,
+                "system_prompt": forced_system_prompt,
                 "user_text": forced_user_text,
                 "raw_output": raw,
             },

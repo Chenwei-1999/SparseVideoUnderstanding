@@ -28,7 +28,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import requests
 from PIL import Image
@@ -80,6 +80,8 @@ UNSTRUCTURED_SYSTEM_PROMPT = (
 )
 
 from revise.pnp_prompts import SYSTEM_PROMPT as DEFAULT_SYSTEM_PROMPT
+from revise import pnp_engine
+from revise.pnp_protocols import LoopConfig, RunStats
 from revise.pnp_utils import format_mc_question as _format_question
 from revise.pnp_utils import start_vllm_server as _shared_start_vllm_server
 from revise.pnp_utils import (
@@ -114,6 +116,7 @@ from revise.pnp_utils import (
     unseen_intervals,
     wait_port,
     wait_for_server,
+    wandb_log,
 )
 
 
@@ -507,6 +510,315 @@ def _load_egoschema_hf_samples(
     )
 
 
+def _bare_answer_text(raw: str) -> Optional[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    match = re.fullmatch(r"(?:answer\s*[:：]\s*)?\(?([A-E])\)?\.?", text, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return None
+
+
+class EgoSchemaDataset:
+    def __init__(
+        self,
+        *,
+        dataset_name: str,
+        structured_summary: bool,
+        carry_summary_state: bool,
+        videoespresso_use_official_prompt: bool,
+        videoespresso_with_evidence: bool,
+    ) -> None:
+        self.dataset_name = str(dataset_name).strip().lower()
+        self.structured_summary = bool(structured_summary)
+        self.carry_summary_state = bool(carry_summary_state)
+        self.videoespresso_use_official_prompt = bool(videoespresso_use_official_prompt)
+        self.videoespresso_with_evidence = bool(videoespresso_with_evidence)
+
+    def video_path(self, sample: EgoSchemaSample) -> str:
+        return sample.video_path
+
+    def frame_count(self, sample: EgoSchemaSample) -> int:
+        return sample.frame_count
+
+    def video_id(self, sample: EgoSchemaSample) -> str:
+        return sample.qid or Path(sample.video_path).stem
+
+    def num_choices(self, sample: EgoSchemaSample) -> int:
+        return len(sample.choices)
+
+    def normalize_answer(self, sample: EgoSchemaSample, answer_text: str) -> Optional[str]:
+        return normalize_answer_letter(answer_text, self.num_choices(sample))
+
+    def ground_truth_letter(self, sample: EgoSchemaSample) -> Optional[str]:
+        if 0 <= int(sample.answer_idx) < self.num_choices(sample):
+            return chr(ord("A") + int(sample.answer_idx))
+        return None
+
+    def is_correct(self, sample: EgoSchemaSample, pred_letter: str) -> bool:
+        return pred_letter == self.ground_truth_letter(sample)
+
+    def log_fields(self, sample: EgoSchemaSample) -> dict[str, Any]:
+        return {
+            "sample_id": sample.sample_id,
+            "qid": sample.qid,
+            "video_id": self.video_id(sample),
+            "video_path": sample.video_path,
+            "question": sample.question,
+            "choices": sample.choices,
+            "ground_truth_idx": sample.answer_idx,
+            "task": sample.task,
+            "evidence": sample.evidence,
+            "dataset_name": self.dataset_name,
+        }
+
+    def format_question(self, sample: EgoSchemaSample) -> str:
+        if self.dataset_name == "videoespresso" and self.videoespresso_use_official_prompt:
+            return format_videoespresso_question_block(
+                sample.question,
+                sample.choices,
+                task=sample.task,
+                evidence=sample.evidence,
+                with_evidence=self.videoespresso_with_evidence,
+                revise_answer_tags=True,
+            )
+        return _format_question(sample.question, sample.choices)
+
+    def system_prompt(self, cfg: LoopConfig) -> str:
+        return _system_prompt_for_mode(
+            structured_summary=self.structured_summary,
+            max_frames_per_round=cfg.max_frames_per_round,
+        )
+
+    def build_user_text(self, **kwargs: Any) -> str:
+        return _build_user_text(
+            kwargs["question_block"],
+            kwargs["summary"],
+            kwargs["frame_count"],
+            kwargs["round_idx"],
+            kwargs["frame_indices"],
+            kwargs["seen_frames"],
+            hide_seen_frames=bool(kwargs.get("hide_seen_frames", False)),
+            candidate_unseen_frames=kwargs.get("candidate_unseen_frames"),
+            use_candidate_frame_ids=bool(kwargs.get("use_candidate_frame_ids", False)),
+            require_candidate_frames=bool(kwargs.get("require_candidate_frames", False)),
+            carry_summary_state=self.carry_summary_state,
+        )
+
+    def extract_frames(self, sample: EgoSchemaSample, indices: list[int]) -> list[Image.Image]:
+        return extract_frames(sample.video_path, indices)
+
+    def sample_unseen_frames(self, frame_count: int, seen: set[int], k: int, rng: random.Random) -> list[int]:
+        return _sample_unseen_frames(frame_count, seen, k, rng=rng)
+
+    def retry_feedback_text(
+        self,
+        reason: str,
+        *,
+        force_answer: bool = False,
+        max_frames_per_round: int = 0,
+        frame_count: int = 0,
+        seen_frames: Optional[list[int]] = None,
+    ) -> str:
+        _ = reason, force_answer, max_frames_per_round, frame_count, seen_frames
+        summary_rule = (
+            "Summary must contain P/O/H/U/R in order, with meaningful text (no placeholders). "
+            if self.structured_summary
+            else "Summary must be meaningful natural language, with no empty placeholder text. "
+        )
+        return (
+            "Invalid response: every response MUST begin with <think>...</think>. "
+            "On a Select round, follow <think> with <summarize> then <select>; "
+            "on the Answer round, follow <think> with <answer> only. "
+            f"{summary_rule}"
+            "If answering, <answer> must be exactly one letter (A/B/C/D/E)."
+        )
+
+    def load_video_captions(self, captions_dir: str, video_id: str) -> dict[int, str]:
+        _ = captions_dir, video_id
+        return {}
+
+    def get_video_fps(self, video_path: str) -> float:
+        _ = video_path
+        return 0.0
+
+    def caption_key_for_frame_index(self, frame_idx: int, fps: float) -> int:
+        _ = fps
+        return int(frame_idx)
+
+    def parse_think(self, raw: str) -> Optional[str]:
+        think = extract_tag(raw, THINK_RE)
+        if think is not None:
+            return think
+        if _bare_answer_text(raw) is not None:
+            return ""
+        return None
+
+    def parse_summary(self, raw: str) -> Optional[str]:
+        return extract_tag(raw, SUMMARIZE_RE)
+
+    def parse_answer(self, raw: str) -> Optional[str]:
+        return extract_tag(raw, ANSWER_RE) or _bare_answer_text(raw)
+
+    def parse_select(self, raw: str) -> Optional[str]:
+        return extract_tag(raw, SELECT_RE)
+
+    def should_commit_summary(self, summary: Optional[str], *, seen_count: int) -> bool:
+        _ = seen_count
+        if not self.carry_summary_state:
+            return False
+        if summary is None and not self.structured_summary:
+            return False
+        return _summary_is_valid_for_mode(summary, require_structured=self.structured_summary)
+
+    def is_select_summary_valid(self, summary: Optional[str], *, seen_count: int) -> bool:
+        _ = seen_count
+        if summary is None and not self.structured_summary:
+            return True
+        return _summary_is_valid_for_mode(summary, require_structured=self.structured_summary)
+
+    def is_summary_stale(self, summary: Optional[str], *, seen_count: int) -> bool:
+        _ = summary, seen_count
+        return False
+
+    def select_has_range_syntax(self, frames_text: str) -> bool:
+        _ = frames_text
+        return False
+
+    def parse_select_frames(self, frames_text: str) -> list[int]:
+        return dedupe_preserve_order(parse_int_list(frames_text))
+
+    def map_candidate_frame_ids(
+        self,
+        requested_ids: list[int],
+        candidate_frames: list[int],
+    ) -> Optional[list[int]]:
+        mapped: list[int] = []
+        for cid in requested_ids:
+            if 1 <= cid <= len(candidate_frames):
+                mapped.append(int(candidate_frames[cid - 1]))
+            else:
+                return None
+        return dedupe_preserve_order(mapped)
+
+    def filter_requested_frames(
+        self,
+        requested_frames: list[int],
+        *,
+        frame_count: int,
+        seen_frames: list[int],
+        candidate_frames: list[int],
+        require_candidate_frames: bool = False,
+    ) -> tuple[list[int], Optional[str]]:
+        if require_candidate_frames and candidate_frames:
+            allowed = {int(i) for i in candidate_frames}
+            requested_frames = [i for i in requested_frames if int(i) in allowed]
+        allowed_ranges = unseen_intervals(frame_count, seen_frames)
+        return (
+            [
+                i
+                for i in requested_frames
+                if 0 <= i < frame_count and i not in seen_frames and in_intervals(i, allowed_ranges)
+            ],
+            None,
+        )
+
+    def initial_summary(self, cfg: LoopConfig) -> str:
+        _ = cfg
+        return "P: none yet; O: no observations yet; H: no belief yet; U: key details are unknown; R: need frames"
+
+    def final_round_instruction(self, cfg: LoopConfig) -> Optional[str]:
+        _ = cfg
+        return None
+
+    def final_answer_instruction(self, cfg: LoopConfig) -> Optional[str]:
+        _ = cfg
+        return "Output ONLY <think>...</think> then <answer>LETTER</answer>."
+
+    def forced_answer_request(
+        self,
+        sample: EgoSchemaSample,
+        *,
+        question_block: str,
+        frame_count: int,
+        max_rounds: int,
+        system_prompt: str,
+        last_user_text: str,
+        last_images: list[Any],
+    ) -> tuple[str, str, list[Any]]:
+        _ = sample, max_rounds, system_prompt, last_user_text, last_images
+        user_text = (
+            f"Final round: answer now.\n{question_block}\n"
+            f"Total frames L = {frame_count}.\n"
+            "You must answer now.\n"
+            "Output ONLY <think>...</think> then <answer>LETTER</answer>."
+        )
+        return FINAL_ANSWER_SYSTEM_PROMPT, user_text, []
+
+    def should_terminate_on_invalid_summary(self, cfg: LoopConfig) -> bool:
+        _ = cfg
+        return True
+
+    def should_fail_on_empty_images(self, cfg: LoopConfig) -> bool:
+        _ = cfg
+        return True
+
+
+class EgoSchemaVllmHttpBackend:
+    def __init__(
+        self,
+        *,
+        restart_on_request_exception: bool = False,
+        restart_server: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self.restart_on_request_exception = bool(restart_on_request_exception)
+        self.restart_server = restart_server
+
+    def chat(self, **kwargs: Any) -> str:
+        try:
+            return self._chat_once(**kwargs)
+        except requests.exceptions.RequestException:
+            if not (self.restart_on_request_exception and self.restart_server is not None):
+                raise
+            self.restart_server()
+            return self._chat_once(**kwargs)
+
+    def _chat_once(self, **kwargs: Any) -> str:
+        user_text = str(kwargs["user_text"])
+        images = list(kwargs.get("images") or [])
+        content: str | list[dict[str, Any]]
+        if images:
+            content = [
+                {"type": "text", "text": user_text},
+                *[
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64_jpeg(img)}"},
+                    }
+                    for img in images
+                ],
+            ]
+        else:
+            content = user_text
+        messages = [
+            {"role": "system", "content": kwargs["system_prompt"]},
+            {"role": "user", "content": content},
+        ]
+        return _call_chat_completions(
+            kwargs["base_url"],
+            kwargs["model_id"],
+            messages,
+            temperature=kwargs["temperature"],
+            top_p=kwargs["top_p"],
+            max_tokens=kwargs["max_tokens"],
+            timeout_s=kwargs["timeout_s"],
+        )
+
+    def get_model_id(self, base_url: str, model_id: Optional[str] = None) -> str:
+        return get_model_id(base_url, model_id=model_id)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True, help="HF model id or local snapshot path")
@@ -756,10 +1068,6 @@ def main() -> int:
     base_url = resolve_base_url(args.base_url, args.host, args.port)
     model_id: Optional[str] = None
     structured_summary = not bool(args.ablate_structured_summary)
-    system_prompt = _system_prompt_for_mode(
-        structured_summary=structured_summary,
-        max_frames_per_round=args.max_frames_per_round,
-    )
 
     def _ensure_server() -> None:
         nonlocal server_proc, model_id
@@ -796,445 +1104,162 @@ def main() -> int:
                     done_ids.add(sid)
 
     # Eval loop
-    correct = 0
-    total = 0
-    failed = 0
-    total_rounds = 0
-    invalid_outputs = 0
-    total_retries = 0
-    total_model_calls = 0
-    fallback_frames_used = 0
     start_time = time.time()
+    legacy_total_rounds = 0
+    stats = RunStats()
+    ds = EgoSchemaDataset(
+        dataset_name=dataset_name,
+        structured_summary=structured_summary,
+        carry_summary_state=not bool(args.ablate_state_carryover),
+        videoespresso_use_official_prompt=bool(args.videoespresso_use_official_prompt),
+        videoespresso_with_evidence=bool(args.videoespresso_with_evidence),
+    )
+    be = EgoSchemaVllmHttpBackend(
+        restart_on_request_exception=bool(args.restart_server_on_failure and args.start_server),
+        restart_server=_restart_server,
+    )
+    cfg = LoopConfig(
+        max_rounds=args.max_rounds,
+        max_frames_per_round=args.max_frames_per_round,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
+        request_timeout_s=args.request_timeout_s,
+        max_retries_per_round=args.max_retries_per_round,
+        strict_actions=bool(args.strict_actions),
+        force_final_answer=bool(args.force_final_answer),
+        use_candidate_frames=bool(args.use_candidate_frames),
+        candidate_k=int(args.candidate_k),
+        use_candidate_frame_ids=bool(args.use_candidate_frame_ids),
+        require_candidate_frames=bool(args.require_candidate_frames),
+        answer_only_final_round=False,
+        observation_mode="image",
+        caption_include="none",
+        caption_max_chars=0,
+        captions_dir=None,
+        hide_seen_frames_in_prompt=bool(args.hide_seen_frames_in_prompt),
+        log_jsonl=log_jsonl,
+        seed=int(args.seed),
+        fallback_on_invalid_candidate_ids=False,
+    )
 
-    for i, sample in enumerate(samples):
+    for sample in samples:
         if sample.sample_id in done_ids:
             continue
 
-        total += 1
-        if dataset_name == "videoespresso" and args.videoespresso_use_official_prompt:
-            question_block = format_videoespresso_question_block(
-                sample.question,
-                sample.choices,
-                task=sample.task,
-                evidence=sample.evidence,
-                with_evidence=bool(args.videoespresso_with_evidence),
-                revise_answer_tags=True,
+        stats.processed += 1
+        try:
+            _ensure_server()
+            assert model_id is not None
+            outcome = pnp_engine.run_sample(
+                sample,
+                dataset=ds,
+                backend=be,
+                cfg=cfg,
+                stats=stats,
+                rng=rng,
+                base_url=base_url,
+                model_id=model_id,
+                run=wandb_run,
             )
-        else:
-            question_block = _format_question(sample.question, sample.choices)
-        summary_state = "P: none yet; O: no observations yet; H: no belief yet; U: key details are unknown; R: need frames"
-        seen_frames: list[int] = []
-        used_images: list[Image.Image] = []
-        final_answer: Optional[str] = None
-        answer_round: Optional[int] = None
-        illegal_action = False
-        per_sample_invalid = 0
-        per_sample_retries = 0
-
-        # Compute frame_count lazily.
-        frame_count = sample.frame_count
-        if frame_count <= 0:
-            try:
-                import decord
-
-                vr = decord.VideoReader(sample.video_path, ctx=decord.cpu(0))
-                frame_count = int(len(vr))
-            except Exception:
-                frame_count = 0
-
-        init_frames = sample_uniform_indices(frame_count, args.max_frames_per_round)
-
-        for round_idx in range(1, args.max_rounds + 1):
-            if round_idx == 1:
-                frames_this_round = init_frames
-            else:
-                if not frames_this_round:
-                    frames_this_round = sample_uniform_indices(frame_count, 1)
-
-            images = extract_frames(sample.video_path, frames_this_round)
-            if not images:
-                # fallback: if decoding fails, skip sample
-                failed += 1
-                illegal_action = True
-                break
-
-            used_images.extend(images)
-            seen_frames = dedupe_preserve_order(seen_frames + frames_this_round)
-
-            candidate_unseen = None
-            if args.use_candidate_frames:
-                candidate_unseen = propose_candidate_frames(
-                    frame_count, set(seen_frames), args.candidate_k, rng=rng
-                )
-
-            user_text = _build_user_text(
-                question_block,
-                summary_state,
-                frame_count,
-                round_idx,
-                frame_indices=frames_this_round,
-                seen_frames=seen_frames,
-                hide_seen_frames=args.hide_seen_frames_in_prompt,
-                candidate_unseen_frames=candidate_unseen,
-                use_candidate_frame_ids=args.use_candidate_frame_ids,
-                require_candidate_frames=args.require_candidate_frames,
-                carry_summary_state=not bool(args.ablate_state_carryover),
-            )
-
-            messages: list[dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        *[
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{b64_jpeg(img)}"},
-                            }
-                            for img in images
-                        ],
-                    ],
-                },
-            ]
-
-            try:
-                _ensure_server()
-                assert model_id is not None
-                raw = _call_chat_completions(
-                    base_url,
-                    model_id,
-                    messages,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    max_tokens=args.max_tokens,
-                    timeout_s=args.request_timeout_s,
-                )
-                total_model_calls += 1
-            except Exception as e:
-                if args.restart_server_on_failure and isinstance(e, requests.exceptions.RequestException):
-                    _restart_server()
-                    try:
-                        _ensure_server()
-                        assert model_id is not None
-                        raw = _call_chat_completions(
-                            base_url,
-                            model_id,
-                            messages,
-                            temperature=args.temperature,
-                            top_p=args.top_p,
-                            max_tokens=args.max_tokens,
-                            timeout_s=args.request_timeout_s,
-                        )
-                        total_model_calls += 1
-                    except Exception as retry_exc:
-                        if log_jsonl:
-                            with open(log_jsonl, "a", encoding="utf-8") as f:
-                                f.write(
-                                    json.dumps(
-                                        {
-                                            "sample_id": sample.sample_id,
-                                            "qid": sample.qid,
-                                            "video_path": sample.video_path,
-                                            "question": sample.question,
-                                            "options": sample.choices,
-                                            "task": sample.task,
-                                            "evidence": sample.evidence,
-                                            "dataset_name": dataset_name,
-                                            "round": round_idx,
-                                            "done": True,
-                                            "error": f"{type(retry_exc).__name__}: {retry_exc}",
-                                            "error_stage": "model_call_retry",
-                                        },
-                                        ensure_ascii=False,
-                                    )
-                                    + "\n"
-                                )
-                        failed += 1
-                        illegal_action = True
-                        break
-                else:
-                    if log_jsonl:
-                        with open(log_jsonl, "a", encoding="utf-8") as f:
-                            f.write(
-                                json.dumps(
-                                    {
-                                        "sample_id": sample.sample_id,
-                                        "qid": sample.qid,
-                                        "video_path": sample.video_path,
-                                        "question": sample.question,
-                                        "options": sample.choices,
-                                        "task": sample.task,
-                                        "evidence": sample.evidence,
-                                        "dataset_name": dataset_name,
-                                        "round": round_idx,
-                                        "done": True,
-                                        "error": f"{type(e).__name__}: {e}",
-                                        "error_stage": "model_call",
-                                    },
-                                    ensure_ascii=False,
-                                )
-                                + "\n"
-                            )
-                    failed += 1
-                    illegal_action = True
-                    break
-
-            answer_text = extract_tag(raw, ANSWER_RE)
-            frames_text = extract_tag(raw, SELECT_RE)
-            summary_text = extract_tag(raw, SUMMARIZE_RE)
-            think_text = extract_tag(raw, THINK_RE)
-
-            def _log_event(done: bool, **extra: Any) -> None:
-                if not log_jsonl:
-                    return
-                rec = {
-                    "sample_id": sample.sample_id,
-                    "qid": sample.qid,
-                    "video_path": sample.video_path,
-                    "question": sample.question,
-                    "options": sample.choices,
-                    "answer_gt": chr(ord("A") + int(sample.answer_idx)),
-                    "task": sample.task,
-                    "evidence": sample.evidence,
-                    "dataset_name": dataset_name,
-                    "videoespresso_official_prompt": bool(
-                        dataset_name == "videoespresso" and args.videoespresso_use_official_prompt
-                    ),
-                    "videoespresso_with_evidence": bool(
-                        dataset_name == "videoespresso" and args.videoespresso_with_evidence
-                    ),
-                    "round": round_idx,
-                    "done": bool(done),
-                    "system_prompt": system_prompt,
-                    "user_text": user_text,
-                    "shown_frames": frames_this_round,
-                    "seen_frames": seen_frames,
-                    "candidate_unseen": candidate_unseen,
-                    "ablate_state_carryover": bool(args.ablate_state_carryover),
-                    "ablate_structured_summary": bool(args.ablate_structured_summary),
-                    "raw_output": raw,
-                    **extra,
-                }
+        except Exception as e:
+            stats.failed += 1
+            if log_jsonl:
                 with open(log_jsonl, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-            # Strict protocol checks + retry loop
-            retries_left = int(args.max_retries_per_round)
-            while True:
-                invalid = False
-                invalid_reason = None
-                # Paper protocol: every response MUST begin with a <think> trace.
-                if think_text is None:
-                    invalid = True
-                    invalid_reason = "missing_think"
-                if answer_text:
-                    # Strict-paper Answer round: <think> + <answer> only; no <summarize> required.
-                    norm = normalize_answer_letter(answer_text, len(sample.choices))
-                    if norm is None:
-                        invalid = True
-                        invalid_reason = "invalid_answer"
-                    else:
-                        final_answer = norm
-                        answer_round = round_idx
-                else:
-                    # Select round: require a valid <summarize> and a <select> request.
-                    if not _summary_is_valid_for_mode(summary_text, require_structured=structured_summary):
-                        invalid = True
-                        invalid_reason = "invalid_summary"
-                    elif frames_text is None:
-                        invalid = True
-                        invalid_reason = "missing_frames"
-
-                if not invalid:
-                    break
-
-                per_sample_invalid += 1
-                invalid_outputs += 1
-                if retries_left <= 0:
-                    illegal_action = True
-                    if args.strict_actions:
-                        _log_event(True, illegal_action=True, invalid_reason=invalid_reason, retries_used=per_sample_retries)
-                        break
-                    break
-                retries_left -= 1
-                per_sample_retries += 1
-                total_retries += 1
-                feedback = (
-                    "Invalid response: every response MUST begin with <think>...</think>. "
-                    "On a Select round, follow <think> with <summarize> then <select>; "
-                    "on the Answer round, follow <think> with <answer> only. "
-                    + (
-                        "Summary must contain P/O/H/U/R in order, with meaningful text (no placeholders). "
-                        if structured_summary
-                        else "Summary must be meaningful natural language, with no empty placeholder text. "
+                    f.write(
+                        json.dumps(
+                            {
+                                "sample_id": sample.sample_id,
+                                "qid": sample.qid,
+                                "video_path": sample.video_path,
+                                "question": sample.question,
+                                "options": sample.choices,
+                                "task": sample.task,
+                                "evidence": sample.evidence,
+                                "dataset_name": dataset_name,
+                                "done": True,
+                                "error": f"{type(e).__name__}: {e}",
+                                "error_stage": "shared_engine",
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
                     )
-                    +
-                    "If answering, <answer> must be exactly one letter (A/B/C/D/E)."
-                )
-                messages.append({"role": "assistant", "content": raw})
-                messages.append({"role": "user", "content": feedback})
-                try:
-                    _ensure_server()
-                    assert model_id is not None
-                    raw = _call_chat_completions(
-                        base_url,
-                        model_id,
-                        messages,
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        max_tokens=args.max_tokens,
-                        timeout_s=args.request_timeout_s,
-                    )
-                    total_model_calls += 1
-                except Exception:
-                    illegal_action = True
-                    break
+            if (
+                args.restart_server_on_failure
+                and args.start_server
+                and not be.restart_on_request_exception
+                and isinstance(e, requests.exceptions.RequestException)
+            ):
+                _restart_server()
+            continue
 
-                answer_text = extract_tag(raw, ANSWER_RE)
-                frames_text = extract_tag(raw, SELECT_RE)
-                summary_text = extract_tag(raw, SUMMARIZE_RE)
-                think_text = extract_tag(raw, THINK_RE)
-
-            if illegal_action:
-                break
-
-            if summary_text and not args.ablate_state_carryover:
-                summary_state = summary_text.strip()
-
-            if final_answer is not None:
-                _log_event(True, final_answer=final_answer, retries_used=per_sample_retries, invalid_outputs=per_sample_invalid)
-                break
-
-            # Frame request path.
-            assert frames_text is not None
-            requested = dedupe_preserve_order(parse_int_list(frames_text))
-            if args.use_candidate_frame_ids and candidate_unseen:
-                mapped: list[int] = []
-                invalid_id = False
-                for cid in requested:
-                    if 1 <= cid <= len(candidate_unseen):
-                        mapped.append(int(candidate_unseen[cid - 1]))
-                    else:
-                        invalid_id = True
-                if invalid_id:
-                    per_sample_invalid += 1
-                    invalid_outputs += 1
-                    illegal_action = True if args.strict_actions else False
-                    break
-                requested = dedupe_preserve_order(mapped)
-            elif args.require_candidate_frames and candidate_unseen:
-                allowed = {int(i) for i in candidate_unseen}
-                requested = [i for i in requested if int(i) in allowed]
-            if not requested:
-                per_sample_invalid += 1
-                invalid_outputs += 1
-                illegal_action = True if args.strict_actions else False
-                break
-
-            allowed_ranges = unseen_intervals(frame_count, seen_frames)
-            next_frames = [i for i in requested if 0 <= i < frame_count and i not in seen_frames and in_intervals(i, allowed_ranges)]
-            if not next_frames:
-                fallback_frames_used += 1
-                # fallback: sample a new unseen frame
-                fallback = _sample_unseen_frames(frame_count, set(seen_frames), args.max_frames_per_round, rng=rng)
-                next_frames = fallback[: args.max_frames_per_round] if fallback else sample_uniform_indices(frame_count, 1)
-            frames_this_round = next_frames[: args.max_frames_per_round]
-
-            _log_event(False, requested_frames=requested, next_frames=frames_this_round, retries_used=per_sample_retries)
-
-        # End per-sample
-        if final_answer is None:
-            if args.force_final_answer and not illegal_action:
-                # Final forced answer-only prompt (no images).
-                user_text = (
-                    f"Final round: answer now.\n{question_block}\n"
-                    f"Total frames L = {frame_count}.\n"
-                    "You must answer now.\n"
-                    "Output ONLY <think>...</think> then <answer>LETTER</answer>."
-                )
-                messages = [
-                    {"role": "system", "content": FINAL_ANSWER_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_text},
-                ]
-                try:
-                    _ensure_server()
-                    assert model_id is not None
-                    raw = _call_chat_completions(
-                        base_url,
-                        model_id,
-                        messages,
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        max_tokens=args.max_tokens,
-                        timeout_s=args.request_timeout_s,
-                    )
-                    total_model_calls += 1
-                    answer_text = extract_tag(raw, ANSWER_RE)
-                    final_answer = normalize_answer_letter(answer_text or "", len(sample.choices))
-                    if log_jsonl:
-                        rec = {
-                            "sample_id": sample.sample_id,
-                            "qid": sample.qid,
-                            "video_path": sample.video_path,
-                            "round": int(args.max_rounds) + 1,
-                            "done": final_answer is not None,
-                            "forced_answer": True,
-                            "system_prompt": FINAL_ANSWER_SYSTEM_PROMPT,
-                            "user_text": user_text,
-                            "raw_output": raw,
-                            "final_answer": final_answer,
-                        }
-                        with open(log_jsonl, "a", encoding="utf-8") as f:
-                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    if final_answer is not None:
-                        answer_round = int(args.max_rounds)
-                except Exception as e:
-                    if log_jsonl:
-                        rec = {
-                            "sample_id": sample.sample_id,
-                            "qid": sample.qid,
-                            "video_path": sample.video_path,
-                            "round": int(args.max_rounds) + 1,
-                            "done": False,
-                            "forced_answer": True,
-                            "system_prompt": FINAL_ANSWER_SYSTEM_PROMPT,
-                            "user_text": user_text,
-                            "error": repr(e),
-                        }
-                        with open(log_jsonl, "a", encoding="utf-8") as f:
-                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    final_answer = None
-
-        if final_answer is None:
-            if not illegal_action:
-                failed += 1
+        if outcome.answer_letter is None:
+            if not outcome.terminated_invalid_action:
+                stats.failed += 1
         else:
-            if final_answer == chr(ord("A") + int(sample.answer_idx)):
-                correct += 1
-            if answer_round is not None:
-                total_rounds += int(min(int(answer_round), int(args.max_rounds)))
-        if total % args.progress_interval == 0:
+            if ds.is_correct(sample, outcome.answer_letter):
+                stats.correct += 1
+            legacy_total_rounds += int(min(int(outcome.round_idx), int(args.max_rounds)))
+
+        if log_jsonl:
+            with open(log_jsonl, "a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "sample_id": sample.sample_id,
+                            "qid": sample.qid,
+                            "video_path": sample.video_path,
+                            "question": sample.question,
+                            "options": sample.choices,
+                            "answer_gt": chr(ord("A") + int(sample.answer_idx)),
+                            "task": sample.task,
+                            "evidence": sample.evidence,
+                            "dataset_name": dataset_name,
+                            "round": int(min(int(outcome.round_idx), int(args.max_rounds))),
+                            "done": True,
+                            "final_answer": outcome.answer_letter,
+                            "illegal_action": bool(outcome.terminated_invalid_action),
+                            "terminated_reason": outcome.terminated_reason,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+        total = stats.processed
+        failed = stats.failed
+        correct = stats.correct
+        invalid_outputs = stats.invalid_outputs
+        total_model_calls = stats.total_model_calls
+        if args.progress_interval > 0 and total % args.progress_interval == 0:
             acc = correct / max(1, total - failed)
-            avg_r = total_rounds / max(1, total - failed)
+            avg_r = legacy_total_rounds / max(1, total - failed)
             msg = f"[progress] {total}/{len(samples)} done | acc={acc:.3f} avg_rounds={avg_r:.2f} failed={failed} invalid={invalid_outputs} calls={total_model_calls}"
             print(msg, flush=True)
-            if wandb_run is not None:
-                wandb_run.log(
-                    {
-                        "progress/samples": total,
-                        "progress/failed": failed,
-                        "metrics/accuracy": acc,
-                        "metrics/avg_rounds": avg_r,
-                        "debug/invalid_outputs": invalid_outputs,
-                        "debug/total_model_calls": total_model_calls,
-                    }
-                )
+            wandb_log(
+                wandb_run,
+                {
+                    "progress/samples": total,
+                    "progress/failed": failed,
+                    "metrics/accuracy": acc,
+                    "metrics/avg_rounds": avg_r,
+                    "debug/invalid_outputs": invalid_outputs,
+                    "debug/total_model_calls": total_model_calls,
+                },
+                step=total,
+            )
 
     elapsed_s = time.time() - start_time
-    denom = max(1, total)
+    total = stats.processed
+    correct = stats.correct
+    failed = stats.failed
+    invalid_outputs = stats.invalid_outputs
+    total_retries = stats.total_retries
+    total_model_calls = stats.total_model_calls
+    fallback_frames_used = stats.fallback_frames_used
     acc = correct / max(1, total - failed) if total > failed else 0.0
-    avg_rounds = total_rounds / max(1, total - failed) if total > failed else 0.0
+    avg_rounds = legacy_total_rounds / max(1, total - failed) if total > failed else 0.0
 
     results = {
         "samples": total,

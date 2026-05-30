@@ -110,6 +110,28 @@ class Dataset(Protocol):
         require_candidate_frames: bool = False,
     ) -> tuple[list[int], Optional[str]]: ...
 
+    def initial_summary(self, cfg: "LoopConfig") -> str: ...
+
+    def final_round_instruction(self, cfg: "LoopConfig") -> Optional[str]: ...
+
+    def final_answer_instruction(self, cfg: "LoopConfig") -> Optional[str]: ...
+
+    def forced_answer_request(
+        self,
+        sample: Any,
+        *,
+        question_block: str,
+        frame_count: int,
+        max_rounds: int,
+        system_prompt: str,
+        last_user_text: str,
+        last_images: list[Any],
+    ) -> tuple[str, str, list[Any]]: ...
+
+    def should_terminate_on_invalid_summary(self, cfg: "LoopConfig") -> bool: ...
+
+    def should_fail_on_empty_images(self, cfg: "LoopConfig") -> bool: ...
+
 
 class Backend(Protocol):
     """Model backend operation used by the shared plug-and-play loop."""

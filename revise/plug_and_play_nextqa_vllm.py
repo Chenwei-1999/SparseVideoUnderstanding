@@ -726,6 +726,47 @@ class NextQADataset:
             None,
         )
 
+    def initial_summary(self, cfg: LoopConfig) -> str:
+        _ = cfg
+        return (
+            "P: I will summarize what has been shown so far; "
+            "O: I will record the key observations from the current evidence; "
+            "H: I will update my belief as new evidence arrives; "
+            "U: some key detail may still be unclear; "
+            "R: request more evidence if needed"
+        )
+
+    def final_round_instruction(self, cfg: LoopConfig) -> Optional[str]:
+        _ = cfg
+        return "This is the final round. You MUST answer now using <think>...</think> then <answer>LETTER</answer>."
+
+    def final_answer_instruction(self, cfg: LoopConfig) -> Optional[str]:
+        _ = cfg
+        return "Max rounds reached. Provide the final answer now using <think>...</think> then <answer>LETTER</answer>."
+
+    def forced_answer_request(
+        self,
+        sample: NextQASample,
+        *,
+        question_block: str,
+        frame_count: int,
+        max_rounds: int,
+        system_prompt: str,
+        last_user_text: str,
+        last_images: list[Any],
+    ) -> tuple[str, str, list[Any]]:
+        _ = sample, question_block, frame_count, max_rounds
+        instruction = "Max rounds reached. Provide the final answer now using <think>...</think> then <answer>LETTER</answer>."
+        return system_prompt, f"{last_user_text}\n\n{instruction}", last_images
+
+    def should_terminate_on_invalid_summary(self, cfg: LoopConfig) -> bool:
+        _ = cfg
+        return False
+
+    def should_fail_on_empty_images(self, cfg: LoopConfig) -> bool:
+        _ = cfg
+        return False
+
 
 class VllmHttpBackend:
     def chat(self, **kwargs: Any) -> str:
