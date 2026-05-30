@@ -44,12 +44,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from revise.pnp_prompts import SYSTEM_PROMPT_WITH_THINK as DEFAULT_SYSTEM_PROMPT_WITH_THINK
+from revise.pnp_utils import FORCE_ANSWER_INSTRUCTIONS_SIMPLE as _FORCE_ANSWER_INSTRUCTIONS
+from revise.pnp_utils import chat_once as _shared_chat_once
+from revise.pnp_utils import start_vllm_server as _shared_start_vllm_server
 from revise.pnp_utils import (
     ANSWER_RE,
     SELECT_RE,
     SUMMARIZE_RE,
     THINK_RE,
-    b64_jpeg,
     collapse_ws,
     dedupe_preserve_order,
     ensure_writable_hf_cache,
@@ -72,8 +74,6 @@ from revise.pnp_utils import (
     sample_uniform_indices_inclusive,
     shard_by_video,
     stable_sample_id_dataset,
-    build_vllm_serve_command,
-    open_server_log_streams,
     retry_feedback_text,
     stop_server,
     timeline_len_1fps,
@@ -113,18 +113,15 @@ def _retry_feedback_text(feedback: str, *, force_answer: bool) -> str:
     return retry_feedback_text(
         feedback,
         force_answer=force_answer,
-        force_instructions="You MUST answer now. Output <think>...</think> then <answer>LETTER</answer>.",
+        force_instructions=_FORCE_ANSWER_INSTRUCTIONS,
     )
 
 
 def _start_vllm_server(args: argparse.Namespace) -> subprocess.Popen[str]:
-    cmd, env = build_vllm_serve_command(
-        args,
-        image_limit=int(args.max_frames_per_round),
-        cuda_visible_default="0",
+    # Video-MME/LVBench default to a single GPU (cuda_visible_default="0").
+    return _shared_start_vllm_server(
+        args, image_limit=int(args.max_frames_per_round), cuda_visible_default="0"
     )
-    stdout, stderr = open_server_log_streams(args.server_log)
-    return subprocess.Popen(cmd, env=env, stdout=stdout, stderr=stderr)
 
 
 def _chat_once(
@@ -138,48 +135,21 @@ def _chat_once(
     max_tokens: int,
     timeout_s: int,
 ) -> str:
-    content: list[dict[str, Any]] = []
-    parts = user_text.split("<image>") if images else [user_text]
-    if images and (len(parts) - 1) == len(images):
-        for i, img in enumerate(images):
-            if parts[i]:
-                content.append({"type": "text", "text": parts[i]})
-            content.append(
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_jpeg(img, max_edge=384, quality=85)}"}}
-            )
-        if parts[-1]:
-            content.append({"type": "text", "text": parts[-1]})
-    else:
-        for img in images:
-            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_jpeg(img, max_edge=384, quality=85)}"}})
-        content.append({"type": "text", "text": user_text})
-
-    payload = {
-        "model": model_id,
-        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}],
-        "temperature": temperature,
-        "top_p": top_p,
-        "max_tokens": max_tokens,
-    }
-    resp = requests.post(
-        f"{base_url}/v1/chat/completions",
-        headers=get_api_headers(),
-        json=payload,
-        timeout=timeout_s,
+    # Long-video frames are downscaled (max_edge=384, q=85) to keep the
+    # per-prompt payload small; the shared chat_once takes these as kwargs.
+    return _shared_chat_once(
+        base_url,
+        model_id,
+        system_prompt,
+        user_text,
+        images,
+        temperature,
+        top_p,
+        max_tokens,
+        timeout_s,
+        max_edge=384,
+        quality=85,
     )
-    try:
-        resp.raise_for_status()
-    except requests.HTTPError as e:
-        body = ""
-        try:
-            body = (resp.text or "").strip()
-        except Exception:
-            body = ""
-        if len(body) > 2000:
-            body = body[:2000] + "…"
-        raise RuntimeError(f"vLLM HTTP {resp.status_code}: {body}") from e
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
 
 
 def _ensure_yt_dlp(py_bin: str) -> list[str]:

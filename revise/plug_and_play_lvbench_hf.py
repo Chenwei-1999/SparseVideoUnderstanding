@@ -40,6 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from revise.pnp_utils import FORCE_ANSWER_INSTRUCTIONS_SIMPLE as _FORCE_ANSWER_INSTRUCTIONS
 from revise.pnp_utils import (
     ANSWER_RE,
     SELECT_RE,
@@ -243,7 +244,7 @@ def _retry_feedback_text(feedback: str, *, force_answer: bool) -> str:
     return retry_feedback_text(
         feedback,
         force_answer=force_answer,
-        force_instructions="You MUST answer now. Output <think>...</think> then <answer>LETTER</answer>.",
+        force_instructions=_FORCE_ANSWER_INSTRUCTIONS,
     )
 
 
