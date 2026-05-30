@@ -104,6 +104,16 @@ def _read_json_array_prefix(path: str, limit: int) -> tuple[list[Any], bool]:
                     return items, True
                 buf += chunk
                 continue
+            if end == len(buf):
+                # The token consumed the entire buffer, so a primitive (number,
+                # bool, null) might still be truncated at the read boundary --
+                # raw_decode happily returns a digit prefix like "1" as a full
+                # int. Pull more data and re-decode before trusting it; only
+                # treat the token as complete once a delimiter follows or EOF.
+                chunk = f.read(65536)
+                if chunk:
+                    buf += chunk
+                    continue
             items.append(obj)
             buf = buf[end:]
     return items, True

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from scripts.common import _probe_videoespresso_mc
+from scripts.common import _probe_videoespresso_mc, _read_json_array_prefix
 
 
 def _mc_row(i: int) -> dict:
@@ -79,3 +79,26 @@ def test_probe_missing_file_is_not_mc():
 
     assert out["multiple_choice"] is False
     assert out["reason"] == "missing"
+
+
+def test_prefix_reader_handles_primitive_at_chunk_boundary(tmp_path):
+    # A bare number is a complete JSON token on its own, so if its digits
+    # straddle the 64KiB read boundary, a naive raw_decode splits it (e.g.
+    # "12345" -> 1 then 2345). Pad so the number falls exactly on the seam.
+    p = tmp_path / "nums.json"
+    p.write_text("[" + " " * 65534 + "12345, 7]", encoding="utf-8")
+
+    items, is_array = _read_json_array_prefix(str(p), 32)
+
+    assert is_array is True
+    assert items == [12345, 7]
+
+
+def test_prefix_reader_stops_at_limit(tmp_path):
+    p = tmp_path / "many.json"
+    p.write_text(json.dumps([{"i": i} for i in range(100)]), encoding="utf-8")
+
+    items, is_array = _read_json_array_prefix(str(p), 5)
+
+    assert is_array is True
+    assert [row["i"] for row in items] == [0, 1, 2, 3, 4]
