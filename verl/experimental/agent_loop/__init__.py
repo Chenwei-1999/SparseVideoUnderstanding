@@ -19,9 +19,9 @@ from .agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
+from .revise_agent_loop import ReviseAgentLoop
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
-from .revise_agent_loop import ReviseAgentLoop
 
 _ = [SingleTurnAgentLoop, ToolAgentLoop, ReviseAgentLoop]
 

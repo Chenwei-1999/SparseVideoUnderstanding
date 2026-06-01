@@ -268,6 +268,7 @@ class Worker(WorkerHelper):
                 warnings.warn(
                     "Both ROCR_VISIBLE_DEVICES and CUDA_VISIBLE_DEVICES are set; ignoring ROCR_VISIBLE_DEVICES.",
                     RuntimeWarning,
+                    stacklevel=2,
                 )
                 os.environ.pop("ROCR_VISIBLE_DEVICES", None)
                 rocr_val = None

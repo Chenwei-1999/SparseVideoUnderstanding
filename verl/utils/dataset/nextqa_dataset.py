@@ -5,15 +5,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import hashlib
 from dataclasses import dataclass
 from typing import Any, Iterable
 
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+
+from revise.pnp.utils import normalize_video_id, resolve_nextqa_video_path
 
 
 @dataclass
@@ -32,20 +34,19 @@ class NextQASample:
 
 def _normalize_video_id(video_id: Any) -> str:
     """Ensure video_id is a string without decimals."""
-    if isinstance(video_id, (int,)):
-        return str(video_id)
-    if isinstance(video_id, float):
-        return str(int(video_id))
-    return str(video_id)
+    return normalize_video_id(video_id)
 
 
 def _load_map(map_path: str) -> dict[str, str]:
-    with open(map_path, "r", encoding="utf-8") as f:
+    with open(map_path, encoding="utf-8") as f:
         data = json.load(f)
     return {str(k): v for k, v in data.items()}
 
 
-def _build_video_path(video_root: str, rel_path: str) -> str:
+def _build_video_path(video_root: str, rel_path: str, video_id: Any | None = None) -> str:
+    resolved = resolve_nextqa_video_path(video_root, rel_path, video_id)
+    if resolved is not None:
+        return resolved
     if rel_path.endswith(".mp4"):
         return os.path.join(video_root, rel_path)
     return os.path.join(video_root, f"{rel_path}.mp4")
@@ -92,7 +93,7 @@ class NextQADataset(Dataset):
         self.tokenizer = tokenizer
         self.processor = processor
 
-        if isinstance(data_files, (list, tuple)):
+        if isinstance(data_files, list | tuple):
             files = list(data_files)
         else:
             files = [data_files]
@@ -127,7 +128,7 @@ class NextQADataset(Dataset):
             if rel_path is None:
                 # Skip if no mapping available
                 continue
-            video_path = _build_video_path(video_root, rel_path)
+            video_path = _build_video_path(video_root, rel_path, video_id)
             choices = [row[f"a{i}"] for i in range(5)]
             sample = NextQASample(
                 video_id=video_id,

@@ -20,7 +20,6 @@ import os
 from concurrent.futures import Future
 from pprint import pprint
 from typing import Any, Callable, Optional
-from uuid import uuid4
 
 import cloudpickle as pickle
 import numpy as np
@@ -41,6 +40,7 @@ from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core import EngineCoreProc
+
 try:
     from vllm.v1.engine.utils import CoreEngineProcManager
 except ModuleNotFoundError:  # vllm<0.9 may not provide this module
@@ -49,6 +49,7 @@ from vllm.v1.executor.abstract import Executor
 
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.device import get_resource_name, get_visible_devices_keyword
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
@@ -58,7 +59,6 @@ from verl.workers.rollout.utils import (
     is_valid_ipv6_address,
     run_unvicorn,
 )
-from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -198,6 +198,7 @@ class vLLMHttpServer:
         node_rank: int,
         gpus_per_node: int,
         nnodes: int,
+        cuda_visible_devices: str = "",
     ):
         """
         Args:
@@ -208,8 +209,14 @@ class vLLMHttpServer:
             node_rank (int): node rank.
             gpus_per_node (int): number of gpus per node.
             nnodes (int): number of nodes.
+            cuda_visible_devices: accelerator ids that this server may use.
         """
         super().__init__()
+
+        if cuda_visible_devices:
+            os.environ[get_visible_devices_keyword()] = cuda_visible_devices
+        os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
+        os.environ["VERL_RAY_JOB_ID"] = ray.get_runtime_context().get_job_id()
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
@@ -227,6 +234,7 @@ class vLLMHttpServer:
         self.node_rank = node_rank
         self.gpus_per_node = gpus_per_node
         self.nnodes = nnodes
+        self.global_steps = None
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -257,6 +265,15 @@ class vLLMHttpServer:
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
+
+    async def collective_rpc(
+        self,
+        method: str | Callable,
+        timeout: Optional[float] = None,
+        args: tuple = (),
+        kwargs: Optional[dict[str, Any]] = None,
+    ):
+        await self.engine.collective_rpc(method=method, timeout=timeout, args=args, kwargs=kwargs)
 
     async def launch_server(self, master_address: str = None, master_port: int = None):
         if self.node_rank != 0:
@@ -318,6 +335,8 @@ class vLLMHttpServer:
         args = {
             "dtype": self.config.dtype,
             "load_format": self.config.load_format,
+            "distributed_executor_backend": "mp",
+            "worker_extension_cls": "verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension",
             "skip_tokenizer_init": False,
             "trust_remote_code": self.model_config.trust_remote_code,
             "max_model_len": self.config.max_model_len,
@@ -406,18 +425,8 @@ class vLLMHttpServer:
         if server_args.subparser in cmds:
             cmds[server_args.subparser].validate(server_args)
 
-        # 2. setup distributed executor backend
-        distributed_executor_backend = ExternalZeroMQDistributedExecutor if len(self.workers) > 0 else None
-        server_args.distributed_executor_backend = distributed_executor_backend
-
-        zmq_addresses = ray.get([worker.get_zeromq_address.remote() for worker in self.workers])
-        logger.info(
-            f"replica_rank={self.replica_rank}, node_rank={self.node_rank}, nnodes={self.nnodes}, "
-            f"get worker zmq addresses: {zmq_addresses}"
-        )
-        os.environ["VERL_VLLM_ZMQ_ADDRESSES"] = ",".join(zmq_addresses)
-
-        # 3. launch server
+        # 2. launch server. vLLM owns its MP worker processes; the Ray workers
+        # reserve placement and provide the visible-device set for this actor.
         if self.node_rank == 0:
             await self.run_server(server_args)
         else:
@@ -611,26 +620,27 @@ class vLLMHttpServer:
             stop_reason=stop_reason,
         )
 
-    async def wake_up(self):
+    async def wake_up(self, tags: list[str] | None = None):
+        if self.node_rank != 0:
+            return
+
         if self.rollout_mode == RolloutMode.HYBRID:
-            # Call all workers to switch between trainer mode and rollout mode.
-            await asyncio.gather(*[worker.wake_up.remote() for worker in self.workers])
+            await self.engine.wake_up(tags=tags or ["kv_cache", "weights"])
+            await self.engine.reset_prefix_cache()
         elif self.rollout_mode == RolloutMode.COLOCATED:
-            # Directly call engine to wake up without sync weights.
-            if self.node_rank == 0:
-                await self.engine.wake_up(tags=["kv_cache", "weights"])
+            await self.engine.wake_up(tags=tags or ["kv_cache", "weights"])
+            await self.engine.reset_prefix_cache()
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):
+        if self.node_rank != 0 or not self.config.free_cache_engine:
+            return
+
         if self.rollout_mode == RolloutMode.HYBRID:
-            if self.node_rank == 0:
-                await self.engine.reset_prefix_cache()
-            await asyncio.gather(*[worker.sleep.remote() for worker in self.workers])
+            await self.engine.sleep(level=1)
         elif self.rollout_mode == RolloutMode.COLOCATED:
-            if self.node_rank == 0:
-                await self.engine.reset_prefix_cache()
-                await self.engine.sleep(level=1)
+            await self.engine.sleep(level=1)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
@@ -638,8 +648,20 @@ class vLLMHttpServer:
         if self.node_rank == 0:
             await self.engine.reset_prefix_cache()
 
+    async def release_kv_cache(self):
+        """Release only kv-cache memory when the backend supports it."""
+        return
+
+    async def resume_kv_cache(self):
+        """Restore kv-cache memory after weight synchronization."""
+        return
+
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
+
+    async def set_global_steps(self, global_steps: int):
+        """Set the global step of the model weights served by this replica."""
+        self.global_steps = global_steps
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort all ongoing generation requests.
@@ -683,6 +705,10 @@ class vLLMHttpServer:
             logger.error(f"Error aborting requests: {e}")
             return {"aborted_count": 0, "request_ids": [], "error": str(e)}
 
+    async def resume_generation(self):
+        if self.node_rank == 0 and hasattr(self.engine, "resume_generation"):
+            await self.engine.resume_generation()
+
     async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort a specific generation request.
 
@@ -723,10 +749,6 @@ class vLLMHttpServer:
             logger.error(f"Error aborting request {request_id}: {e}")
             return {"aborted": False, "request_id": request_id, "error": str(e)}
 
-
-_rollout_worker_actor_cls = ray.remote(vLLMAsyncRollout)
-
-
 class vLLMReplica(RolloutReplica):
     def __init__(
         self,
@@ -741,13 +763,7 @@ class vLLMReplica(RolloutReplica):
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
         """Get rollout worker actor class for colocated and standalone mode."""
-        worker_dict_cls = RayClassWithInitArgs(
-            cls=_rollout_worker_actor_cls,
-            config=self.config,
-            model_config=self.model_config,
-            device_mesh=None,
-        )
-        return worker_dict_cls
+        return super().get_ray_class_with_init_args()
 
     async def launch_servers(self):
         """Launch http server in each node."""
@@ -755,16 +771,23 @@ class vLLMReplica(RolloutReplica):
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
 
-        # get node_id of all workers
-        worker_node_ids = await asyncio.gather(
+        # get (node_id, visible accelerator id) of all GPU-reserving workers
+        worker_infos = await asyncio.gather(
             *[
-                worker.__ray_call__.remote(lambda self: ray.get_runtime_context().get_node_id())
+                worker.__ray_call__.remote(
+                    lambda self: (
+                        ray.get_runtime_context().get_node_id(),
+                        ray.get_runtime_context().get_accelerator_ids()[get_resource_name()][0],
+                    )
+                )
                 for worker in self.workers
             ]
         )
+        worker_node_ids = [worker_info[0] for worker_info in worker_infos]
+        worker_visible_devices = [worker_info[1] for worker_info in worker_infos]
 
         # For non-data parallel case, there's only one server whether it's single or multi nodes.
-        nnodes, gpus_per_node = self.nnodes, self.gpus_per_node
+        nnodes, gpus_per_node = self.nnodes, self.gpus_per_replica_node
         if self.config.data_parallel_size == 1:
             nnodes = 1
             gpus_per_node = self.world_size
@@ -772,19 +795,29 @@ class vLLMReplica(RolloutReplica):
         # create server actor in each node with node affinity
         for node_rank in range(nnodes):
             workers = self.workers[node_rank * gpus_per_node : (node_rank + 1) * gpus_per_node]
-            node_id = worker_node_ids[node_rank * gpus_per_node]
-            name = (
-                f"vllm_server_{self.replica_rank}_{node_rank}"
-                if not self.is_reward_model
-                else f"vllm_server_reward_{self.replica_rank}_{node_rank}"
+            cuda_visible_devices = ",".join(
+                worker_visible_devices[node_rank * gpus_per_node : (node_rank + 1) * gpus_per_node]
             )
-            name = name + f"_{uuid4().hex[:8]}"
+            node_id = worker_node_ids[node_rank * gpus_per_node]
+            prefix = "vllm_"
+            name = (
+                f"{prefix}server_{self.replica_rank}_{node_rank}"
+                if not self.is_reward_model
+                else f"{prefix}server_reward_{self.replica_rank}_{node_rank}"
+            )
+            env_vars = {
+                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+                "NCCL_CUMEM_ENABLE": "0",
+            }
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,
                     soft=False,
                 ),
+                runtime_env={"env_vars": env_vars},
                 name=name,
+                max_concurrency=self.max_concurrency,
             ).remote(
                 config=self.config,
                 model_config=self.model_config,
@@ -794,6 +827,7 @@ class vLLMReplica(RolloutReplica):
                 node_rank=node_rank,
                 gpus_per_node=gpus_per_node,
                 nnodes=nnodes,
+                cuda_visible_devices=cuda_visible_devices,
             )
             self.servers.append(server)
 

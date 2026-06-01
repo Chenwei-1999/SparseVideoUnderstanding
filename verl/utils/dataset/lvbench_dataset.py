@@ -17,7 +17,6 @@ import torch
 from datasets import load_dataset
 from torch.utils.data import Dataset
 
-
 _OPT_RE = re.compile(r"^\(([A-Z])\)\s*(.*)$")
 
 
@@ -55,7 +54,9 @@ def _format_question(question: str, choices: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _stable_sample_id(dataset: str, video_key: str, uid: str, question: str, choices: list[str], answer_letter: str) -> str:
+def _stable_sample_id(
+    dataset: str, video_key: str, uid: str, question: str, choices: list[str], answer_letter: str
+) -> str:
     payload = {
         "dataset": str(dataset),
         "video_key": str(video_key),
@@ -114,7 +115,7 @@ class LVBenchDataset(Dataset):
 
         # Interpret `data_files` as the split when it looks like a split name.
         split = ""
-        if isinstance(data_files, (list, tuple)):
+        if isinstance(data_files, list | tuple):
             parts = [str(x) for x in data_files if str(x).strip()]
             if len(parts) == 1:
                 split = parts[0]
@@ -223,4 +224,3 @@ class LVBenchDataset(Dataset):
             "dummy_tensor": torch.tensor([0], dtype=torch.uint8),
             "index": idx,
         }
-

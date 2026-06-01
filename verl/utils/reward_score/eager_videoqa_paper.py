@@ -1,6 +1,8 @@
-"""EAGER reward (paper-faithful) for REVISE-style video QA.
+"""EAGER reward formulation for REVISE-style video QA.
 
-This implementation matches the paper's dense, annotation-free formulation:
+This implementation follows the paper's dense, annotation-free reward terms and
+keeps the early-stop bonus coefficient configurable so audited reproduction
+configs can use either the manuscript setting or an empirically safer variant.
 
 Per-step reward:
     r_t = λ1 * r_conf_t + λ2 * r_sum_t + λ3 * r_stop_t + r_format_t
@@ -22,7 +24,6 @@ from __future__ import annotations
 
 import re
 from typing import Any, Optional
-
 
 _ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
 

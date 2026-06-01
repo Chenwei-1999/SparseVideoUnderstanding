@@ -21,10 +21,22 @@ import uvicorn
 import yaml
 from fastapi import FastAPI
 
+from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.workers.config.rollout import PrometheusConfig
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+__all__ = [
+    "ensure_async_iterator",
+    "get_free_port",
+    "get_max_position_embeddings",
+    "is_valid_ipv6_address",
+    "qwen2_5_vl_dedup_image_tokens",
+    "run_unvicorn",
+    "run_uvicorn",
+    "update_prometheus_config",
+]
 
 
 def get_max_position_embeddings(hf_config) -> int:
@@ -77,6 +89,10 @@ async def run_uvicorn(app: FastAPI, server_args, server_address) -> tuple[int, a
         raise RuntimeError("Unexpected: HTTP server started without reporting listened port")
     logger.info(f"HTTP server started on port {server_port}")
     return server_port, server_task
+
+
+# Compatibility for vLLM async server code that imports the historical misspelling.
+run_unvicorn = run_uvicorn
 
 
 async def ensure_async_iterator(iterable):

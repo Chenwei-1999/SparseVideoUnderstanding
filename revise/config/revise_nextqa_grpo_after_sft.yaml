@@ -1,0 +1,120 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+custom_reward_function:
+  path: pkg://verl.utils.reward_score.eager_videoqa_paper
+  name: compute_score
+  reward_kwargs:
+    # r_t = λ1 r_conf + λ2 r_sum + λ3 r_stop + r_format
+    lambda_conf: 1.0
+    lambda_sum: 1.0
+    lambda_stop: 0.5
+    gamma: 0.99
+    format_reward: 0.05
+    stop_round_threshold: 2
+    # Empirical Table 4 setting: the paper-style positive early-stop bonus
+    # collapses the Qwen2.5-VL-3B SFT policy toward one-round answers.
+    stop_bonus_beta: 0.0
+
+data:
+  custom_cls:
+    path: pkg://verl.utils.dataset.nextqa_dataset
+    name: NextQADataset
+  nextqa:
+    video_root: ${oc.env:REVISE_NEXTQA_VIDEO_ROOT,${hydra:runtime.cwd}/data/revise_assets/NExT-QA/NExTVideo}
+    map_json: ${oc.env:REVISE_NEXTQA_MAP_JSON,${hydra:runtime.cwd}/data/revise_assets/NExT-QA/map_vid_vidorID.json}
+  train_files: ${oc.env:REVISE_NEXTQA_TRAIN_CSV,${hydra:runtime.cwd}/data/revise_assets/NExT-QA/nextqa/train.csv}
+  val_files: ${oc.env:REVISE_NEXTQA_VAL_CSV,${hydra:runtime.cwd}/data/revise_assets/NExT-QA/nextqa/val.csv}
+  max_prompt_length: 8192
+  max_response_length: 4096
+  train_batch_size: 8
+  return_raw_chat: True
+  return_multi_modal_inputs: False
+
+actor_rollout_ref:
+  model:
+    # Point to the SFT checkpoint (override via CLI or update after SFT)
+    path: ${oc.env:REVISE_NEXTQA_SFT_PATH,${hydra:runtime.cwd}/outputs/revise_nextqa_sft/global_step_972/huggingface}
+  ref:
+    fsdp_config:
+      model_dtype: bfloat16
+  actor:
+    fsdp_config:
+      model_dtype: bfloat16
+    optim:
+      lr: 1e-6
+    ppo_mini_batch_size: ${data.train_batch_size}
+    use_dynamic_bsz: True
+    use_kl_loss: True
+    kl_loss_coef: 0.001
+    entropy_coeff: 0
+    checkpoint:
+      save_contents: ["hf_model"]
+      load_contents: []
+  rollout:
+    name: vllm
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    max_new_tokens: 256
+    temperature: 0.2
+    top_p: 0.9
+    do_sample: True
+    n: 4
+    dtype: bfloat16
+    gpu_memory_utilization: 0.6
+    enable_chunked_prefill: False
+    enable_prefix_caching: False
+    load_format: auto
+    max_model_len: 12288
+    max_num_batched_tokens: 12288
+    data_parallel_size: 1
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    limit_images: 5
+    agent:
+      num_workers: 1
+      default_agent_loop: revise_agent
+      rollout_mode: hybrid
+    revise:
+      max_rounds: 4
+      max_frames_per_round: 3
+      max_vision_inputs: 5
+      max_retries_per_round: 1
+      # Keep Table 4 early stopping comparable. Use a positive value only for
+      # explicit anti-collapse ablations, not for the default paper setting.
+      min_select_rounds: 0
+      initial_sampling: uniform
+      include_timestamps: True
+      use_1fps_timeline: True
+      compute_margins: True
+      margin_logprobs_k: 64
+      margin_temperature: 1.0
+      summary_only_logprobs_k: 64
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: False
+
+trainer:
+  project_name: revise_nextqa
+  experiment_name: qwen2.5-vl-3b-revise-grpo-after-sft
+  total_epochs: 1
+  total_training_steps: 100
+  n_gpus_per_node: 4
+  resume_mode: disable
+  val_before_train: False
+  test_freq: 100
+  save_freq: 100
+  max_actor_ckpt_to_keep: 1
+  logger: ["console", "wandb"]
+  default_local_dir: ${hydra:runtime.cwd}/outputs/revise_nextqa_grpo_after_sft
+
+ray_kwargs:
+  ray_init:
+    address: local
+    num_cpus: 32

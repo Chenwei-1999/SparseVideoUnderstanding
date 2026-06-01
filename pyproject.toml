@@ -33,7 +33,7 @@ line-length = 120
 exclude = ["scripts/legacy_model_merger.py"]
 
 [tool.ruff.lint]
-isort = {known-first-party = ["verl"]}
+isort = {known-first-party = ["verl", "revise", "scripts"]}
 # c.f. https://github.com/vllm-project/vllm/blob/ce8d6b75fc0586045df75ee1568a5b5f9957251b/pyproject.toml
 select = [
     # pycodestyle
@@ -57,13 +57,18 @@ ignore = [
     "B007",
     # f-string format
     "UP032",
+    # X | Y for type annotations
+    "UP007",
     # `.log()` statement uses f-string
     "G004",
-    # X | None for type annotations
-    "UP045",
     # deprecated import
     "UP035",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["E402"]
+"revise/benchmarks/*.py" = ["E402"]
+"revise/pnp_cli.py" = ["E402"]
 
 # -------------------------------
 # tool.mypy - typechecking config
@@ -110,4 +115,7 @@ verl = [
   "version/*",
   "trainer/config/*.yaml",
   "trainer/config/*/*.yaml",
+]
+revise = [
+  "config/*.yaml",
 ]
