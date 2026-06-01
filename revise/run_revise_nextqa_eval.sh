@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage:
-#   ENGINE=vllm ./revise/run_revise_nextqa_eval.sh
+# Backward-compatible wrapper for the paper-suite NExT-QA plug-and-play row.
+# Prefer calling scripts/paper_suite.py directly in new automation.
 
-ENGINE=${ENGINE:-sglang}
-PROJECT_DIR="$(pwd)"
-CONFIG_PATH="$PROJECT_DIR/revise/config"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/repro_runs/table4_nextqa}"
 
-python3 -m verl.trainer.main_ppo \
-  --config-path "$CONFIG_PATH" \
-  --config-name revise_nextqa_eval \
-  actor_rollout_ref.rollout.name="$ENGINE" \
+"$PYTHON_BIN" scripts/paper_suite.py run \
+  --experiment nextqa_table4_pnp \
+  --output-dir "$OUTPUT_DIR" \
   "$@"

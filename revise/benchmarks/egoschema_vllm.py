@@ -11,7 +11,7 @@ force-requested once ``--max-rounds`` is reached.
 Includes component-ablation switches (e.g. omitting the carried summary state,
 or accepting an unstructured summary) used by the paper's ablations. Run as a
 CLI (see ``main``); invoked by ``run_generate_teacher_data_videoespresso.sh``
-and ``scripts/paper_suite.py``. Shared helpers live in ``revise/pnp_utils.py``.
+and ``scripts/paper_suite.py``. Shared helpers live in ``revise/pnp/utils.py``.
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -34,7 +33,7 @@ import requests
 from PIL import Image
 
 # Allow direct execution via `python examples/...py`.
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -65,7 +64,8 @@ UNSTRUCTURED_SYSTEM_PROMPT = (
     "Do NOT output bare placeholders like '...', 'none', or 'N/A' as the summary.\n\n"
     "Format 1 - Request more frames:\n"
     "<think>...</think>\n"
-    "<summarize>A concise natural-language summary of what is known, what remains uncertain, and what evidence is needed.</summarize>\n"
+    "<summarize>A concise natural-language summary of what is known, what remains uncertain, "
+    "and what evidence is needed.</summarize>\n"
     "<select>1, 3</select>\n\n"
     "Format 2 - Answer now:\n"
     "<think>...</think>\n"
@@ -79,24 +79,24 @@ UNSTRUCTURED_SYSTEM_PROMPT = (
     "- In <answer>, output EXACTLY ONE option letter shown in the question.\n"
 )
 
-from revise.pnp_prompts import SYSTEM_PROMPT as DEFAULT_SYSTEM_PROMPT
-from revise import pnp_harness
-from revise.pnp_protocols import LoopConfig, RunStats
-from revise.pnp_utils import format_mc_question as _format_question
-from revise.pnp_utils import start_vllm_server as _shared_start_vllm_server
-from revise.pnp_utils import (
+from revise.pnp import harness as pnp_harness
+from revise.pnp.prompts import SYSTEM_PROMPT as DEFAULT_SYSTEM_PROMPT
+from revise.pnp.protocols import LoopConfig, RunStats
+from revise.pnp.utils import (
     ANSWER_RE,
     SELECT_RE,
     SUMMARIZE_RE,
     THINK_RE,
     b64_jpeg,
+    build_vllm_serve_command,
     contains_banned_example,
     dedupe_preserve_order,
     ensure_writable_hf_cache,
     extract_frames,
+    extract_openai_message_text,
     extract_tag,
-    format_intervals,
     format_frame_list,
+    format_intervals,
     format_videoespresso_question_block,
     get_api_headers,
     get_model_id,
@@ -105,17 +105,16 @@ from revise.pnp_utils import (
     is_placeholder,
     maybe_init_wandb,
     normalize_answer_letter,
+    open_server_log_streams,
     parse_int_list,
     propose_candidate_frames,
     resolve_base_url,
     sample_uniform_indices,
-    build_vllm_serve_command,
-    open_server_log_streams,
     stop_server,
     summary_has_ohrpu,
     unseen_intervals,
-    wait_port,
     wait_for_server,
+    wait_port,
     wandb_log,
 )
 
@@ -274,7 +273,7 @@ def _call_chat_completions(
     )
     resp.raise_for_status()
     data = resp.json()
-    return str(data["choices"][0]["message"]["content"])
+    return extract_openai_message_text(data["choices"][0]["message"])
 
 
 def _start_vllm_server(args: argparse.Namespace) -> subprocess.Popen[str]:
@@ -331,9 +330,10 @@ def _download_egoschema_video(
     repo_id: str,
 ) -> str | None:
     try:
-        from huggingface_hub import hf_hub_download, hf_hub_url, list_repo_files
-        import fsspec
         import zipfile
+
+        import fsspec
+        from huggingface_hub import hf_hub_download, hf_hub_url, list_repo_files
     except Exception:
         return None
     os.makedirs(video_root, exist_ok=True)
@@ -445,7 +445,7 @@ def _load_egoschema_samples(
     allow_video_download: bool = False,
     egoschema_video_repo: str = "VLM2Vec/egoschema-rawvideo",
 ) -> list[EgoSchemaSample]:
-    with open(json_path, "r", encoding="utf-8") as f:
+    with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, list):
         raise TypeError(f"Expected list in {json_path}, got {type(data)}")
@@ -918,19 +918,28 @@ def main() -> int:
         "--candidate-k",
         type=int,
         default=0,
-        help="Number of candidate unseen frames to propose when --use-candidate-frames is set (default: max(12, max_frames_per_round*4)).",
+        help=(
+            "Number of candidate unseen frames to propose when --use-candidate-frames is set "
+            "(default: max(12, max_frames_per_round*4))."
+        ),
     )
     parser.add_argument(
         "--use-candidate-frame-ids",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="When --use-candidate-frames is enabled, expose candidates as IDs 1..K (not raw indices) and require <select> to output candidate IDs.",
+        help=(
+            "When --use-candidate-frames is enabled, expose candidates as IDs 1..K "
+            "(not raw indices) and require <select> to output candidate IDs."
+        ),
     )
     parser.add_argument(
         "--require-candidate-frames",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="When candidate frames are provided, treat them as an allowlist: <select> must only contain indices within the candidate unseen ranges.",
+        help=(
+            "When candidate frames are provided, treat them as an allowlist: "
+            "<select> must only contain indices within the candidate unseen ranges."
+        ),
     )
     parser.add_argument(
         "--hide-seen-frames-in-prompt",
@@ -946,7 +955,10 @@ def main() -> int:
     parser.add_argument(
         "--ablate-structured-summary",
         action="store_true",
-        help="Component ablation: allow unstructured natural-language <summarize> text instead of requiring P/O/H/U/R fields.",
+        help=(
+            "Component ablation: allow unstructured natural-language <summarize> text "
+            "instead of requiring P/O/H/U/R fields."
+        ),
     )
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.9)
@@ -975,7 +987,10 @@ def main() -> int:
         "--strict-actions",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Terminate the sample immediately on illegal actions (e.g., invalid <select>, missing required tags, <think>).",
+        help=(
+            "Terminate the sample immediately on illegal actions "
+            "(e.g., invalid <select>, missing required tags, <think>)."
+        ),
     )
     parser.add_argument("--log-jsonl", type=str, default=None)
     parser.add_argument("--summary-json", type=str, default=None, help="Optional path to save a run summary JSON.")
@@ -1055,7 +1070,9 @@ def main() -> int:
         "video_root": args.video_root,
         "egoschema_source": args.egoschema_source if dataset_name == "egoschema" else "local",
         "egoschema_hf_config": args.egoschema_hf_config if dataset_name == "egoschema" else None,
-        "auto_download_egoschema_videos": bool(args.auto_download_egoschema_videos) if dataset_name == "egoschema" else False,
+        "auto_download_egoschema_videos": (
+            bool(args.auto_download_egoschema_videos) if dataset_name == "egoschema" else False
+        ),
         "egoschema_video_repo": args.egoschema_video_repo if dataset_name == "egoschema" else None,
         "model_path": args.model_path,
         "engine": "vllm",
@@ -1142,6 +1159,7 @@ def main() -> int:
         max_tokens=args.max_tokens,
         request_timeout_s=args.request_timeout_s,
         max_retries_per_round=args.max_retries_per_round,
+        min_select_rounds=0,
         strict_actions=bool(args.strict_actions),
         force_final_answer=bool(args.force_final_answer),
         use_candidate_frames=bool(args.use_candidate_frames),

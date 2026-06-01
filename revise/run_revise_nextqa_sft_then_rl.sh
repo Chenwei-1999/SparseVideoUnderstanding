@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Usage:
-#   ENGINE=sglang ./revise/run_revise_nextqa_sft_then_rl.sh
+#   ENGINE=vllm ./revise/run_revise_nextqa_sft_then_rl.sh
 #
 # Full pipeline:
 #   1. Generate teacher data (configured teacher on train split) — if not already done
@@ -13,6 +13,9 @@ set -euo pipefail
 # Prerequisites:
 #   Teacher data must be generated first:
 #     ./revise/run_generate_teacher_data.sh
+#
+# For the audited Table 4 RL-after-SFT row, prefer:
+#   python scripts/paper_suite.py run --experiment nextqa_table4_rl_after_sft
 
 PROJECT_DIR="$(pwd)"
 CONFIG_PATH="$PROJECT_DIR/revise/config"

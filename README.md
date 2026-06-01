@@ -4,6 +4,9 @@ This repository contains the code for **REVISE**, a framework for question-aware
 
 REVISE addresses two core challenges in video QA: **information overload** (processing too many redundant frames) and **insufficient key-information awareness** (missing the frames that actually matter). It does so through a multi-round agent loop that iteratively selects a small number of informative frames while maintaining a compact **summary-as-state** across rounds.
 
+For the repository dependency boundaries and extension rules, see
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ## Method Overview
 
 <p align="center">
@@ -55,7 +58,10 @@ are refreshed from those outputs.
 | EgoSchema | GPT-4o + REVISE | 60.6% | 9.8 |
 | NExT-QA | Qwen2.5-VL-3B + REVISE + RL | 51.3% | 3.9 |
 
-RL fine-tuning yields **+19.6pp accuracy** over plug-and-play on NExT-QA while using **fewer frames, fewer rounds, and nearly 2x faster inference**.
+In the original paper table, RL fine-tuning yielded **+19.6pp accuracy** over
+plug-and-play on NExT-QA while using fewer frames, fewer rounds, and nearly 2x
+faster inference. The current open-source reproduction audit has not yet
+re-verified that exact row.
 
 <p align="center">
   <img src="assets/pareto.png" width="55%">
@@ -93,9 +99,142 @@ Paper-level reproduction entrypoints:
 
 ```bash
 ENV_NAME=verlrun INSTALL_BACKENDS=vllm bash scripts/setup_env.sh
-python scripts/doctor.py
+python scripts/doctor.py --scope nextqa
 python scripts/paper_suite.py list
 ```
+
+### Replicate Table 4 on NExT-QA
+
+Table 4 is exposed as four explicit paper-suite IDs. The full commands use the
+official NExT-QA split, `max_rounds=4`, `max_frames_per_round=3`, vLLM tensor
+parallelism over 4 GPUs, and the audited after-SFT EAGER setting for RL. See
+[`docs/NEXTQA_TABLE4_REPRO.md`](docs/NEXTQA_TABLE4_REPRO.md) for the current
+reproduction audit: the corrected RFT setting is runnable and observed but still
+below the paper target, while the paper direct/PnP baseline rows require the
+original Table 4 checkpoint via
+`REVISE_NEXTQA_TABLE4_BASE_MODEL`; the current public Qwen2.5-VL-3B-Instruct
+snapshot is too strong to reproduce those two rows.
+
+```bash
+python scripts/paper_suite.py check \
+  --experiment nextqa_table4_direct \
+  --experiment nextqa_table4_pnp \
+  --experiment nextqa_table4_sft \
+  --experiment nextqa_table4_rl_after_sft
+
+python scripts/paper_suite.py report \
+  --experiment nextqa_table4_direct \
+  --experiment nextqa_table4_pnp \
+  --experiment nextqa_table4_sft \
+  --experiment nextqa_table4_rl_after_sft \
+  --output-dir outputs/repro_runs/table4_nextqa \
+  --output-json outputs/repro_runs/table4_nextqa/report.json
+
+# For RL logging, export WANDB_API_KEY in your shell before launching.
+python scripts/paper_suite.py run --experiment nextqa_table4_rl_after_sft \
+  --output-dir outputs/repro_runs/table4_nextqa
+```
+
+For Table 4 direct/PnP, set the paper baseline checkpoint before `check` or
+`run`:
+
+```bash
+export REVISE_NEXTQA_TABLE4_BASE_MODEL=/path/to/original/table4/baseline/checkpoint
+python scripts/paper_suite.py run --experiment nextqa_table4_pnp \
+  --output-dir outputs/repro_runs/table4_nextqa
+```
+
+The report JSON uses `readiness_status` for runnable/blocker state,
+`paper_reproduction_status` for the suite-level paper claim,
+`paper_target_metrics` for the Table 4 reference numbers from the paper,
+`paper_target_delta` for observed-minus-target gaps, and `observed_metrics` for
+metrics parsed from local run summaries. Use `verification_status` to
+distinguish paper-comparable `observed` runs from `observed_with_blockers`
+diagnostic summaries. Do not treat readiness or observed metrics alone as a
+verified paper result.
+
+For a public-checkpoint plug-and-play sanity run, use the generic non-Table-4
+experiment instead:
+
+```bash
+python scripts/paper_suite.py run --experiment nextqa_pnp \
+  --output-dir outputs/repro_runs/nextqa_public_pnp
+```
+
+Use `--smoke` for a one-sample preflight. PnP/evaluation smoke runs reduce
+tensor parallelism and sample count. The RL-after-SFT smoke command still
+requires 4 visible GPUs because the training batch is sized to exercise the
+same multi-GPU rollout path; use the full commands above for paper-comparable
+numbers.
+
+### Experimental Qwen3.5-4B ablation
+
+The paper rows stay pinned to the Table 4 checkpoint/Qwen2.5-VL setting. For a
+stronger non-paper ablation, the NExT-QA PnP and teacher-generation commands can
+use `Qwen/Qwen3.5-4B` when configured explicitly:
+
+```bash
+python scripts/download_hf_models.py --model qwen35_4b
+export REVISE_QWEN35_4B_PATH="$PWD/data/revise_assets/models/Qwen3.5-4B"
+
+# Or point directly at a served/HF model ID for PnP-only experiments.
+export REVISE_LOCAL_MODEL_PATH=Qwen/Qwen3.5-4B
+export REVISE_LOCAL_MODEL_ID=Qwen/Qwen3.5-4B
+
+python scripts/paper_suite.py run --experiment nextqa_pnp --output-dir outputs/repro_runs/qwen35_nextqa
+```
+
+This is intentionally separate from `nextqa_table4_*`: Qwen3.5-4B changes the
+backbone and may require a newer backend stack that recognizes `model_type:
+qwen3_5` in Transformers/vLLM, or a remote OpenAI-compatible server already
+serving that model. Treat it as an ablation until a smoke run passes.
+
+If you do not already have an NExT-QA SFT checkpoint, generate train-split
+teacher data first. The paper-preferred path is a local/served teacher via
+`./revise/run_generate_teacher_data.sh`. A GPT-5-mini Batch bootstrap path is
+also available and converts back to the same teacher-log JSONL. Generated
+traces are variable length: they contain 1 to `--max-rounds` assistant rounds,
+all non-final rounds are `<select>` rounds, and the final round is the first
+`<answer>` round. This matches the shared REVISE loop used by both PnP and RL
+and avoids teaching the learner to spend the full round budget by default.
+NExT-QA frame actions use a 1-fps timeline in both PnP and RL. The script omits
+`service_tier` by default because Flex availability is
+model/account dependent; pass `--service-tier flex` only when your OpenAI
+project supports it for the selected model.
+
+```bash
+python scripts/nextqa_openai_teacher_batch.py prepare \
+  --max-samples 8000 \
+  --output-jsonl outputs/openai_batch/nextqa_teacher_requests.jsonl \
+  --manifest outputs/openai_batch/nextqa_teacher_manifest.jsonl
+
+# Requires OPENAI_API_KEY and creates one OpenAI Batch job.
+python scripts/nextqa_openai_teacher_batch.py submit \
+  --input-jsonl outputs/openai_batch/nextqa_teacher_requests.jsonl \
+  --output-json outputs/openai_batch/nextqa_teacher_batch.json
+
+# After downloading the completed batch output JSONL:
+python scripts/nextqa_openai_teacher_batch.py convert \
+  --batch-output outputs/openai_batch/nextqa_teacher_batch_output.jsonl \
+  --manifest outputs/openai_batch/nextqa_teacher_manifest.jsonl \
+  --output-log outputs/nextqa_teacher_train_log.jsonl
+
+SFT_INPUT=outputs/nextqa_teacher_train_log.jsonl \
+SFT_GENERATE_ARGS="--max-rounds 4 --min-first-select-ratio 0.45" \
+SFT_CKPT_DIR=outputs/revise_nextqa_sft \
+./revise/run_revise_nextqa_sft.sh
+
+export REVISE_NEXTQA_SFT_PATH="$(find outputs/revise_nextqa_sft -type d \( -name huggingface -o -name hf_model \) | sort -V | tail -1)"
+```
+
+`run_revise_nextqa_sft.sh` writes `revise_sft_provenance.json` beside the SFT
+checkpoint. `paper_suite.py report` requires that provenance, or an equivalent
+`nextqa_table4_sft.settings.json` next to the eval summary, before treating a
+Table 4 SFT summary as observed.
+
+`scripts/doctor.py` defaults to the NExT-QA/Table-4 scope. Use
+`python scripts/doctor.py --scope paper` when checking every dataset used in
+the paper.
 
 Current reproduction behavior:
 
@@ -106,50 +245,56 @@ Current reproduction behavior:
 ### Plug-and-play evaluation (NExT-QA)
 
 ```bash
-# SGLang backend (default)
-ENGINE=sglang ./revise/run_revise_nextqa_eval.sh
-
-# vLLM backend
-ENGINE=vllm ./revise/run_revise_nextqa_eval.sh --config-name revise_nextqa_eval_vllm
-
-# Smoke test (tiny sample, 4 GPUs)
-ENGINE=sglang ./revise/run_revise_nextqa_smoke.sh
+export REVISE_NEXTQA_TABLE4_BASE_MODEL=/path/to/original/table4/baseline/checkpoint
+python scripts/paper_suite.py run --experiment nextqa_table4_pnp \
+  --output-dir outputs/repro_runs/table4_nextqa
 ```
+
+Without the original Table 4 baseline checkpoint, use `nextqa_pnp` for
+public-checkpoint development rather than reporting the result as Table 4.
 
 ### RL fine-tuning (GRPO + EAGER reward)
 
 ```bash
-ENGINE=sglang ./revise/run_revise_nextqa_grpo.sh
+python scripts/paper_suite.py run --experiment nextqa_table4_rl_after_sft \
+  --output-dir outputs/repro_runs/table4_nextqa
 ```
 
-All scripts invoke the same Hydra entry point under the hood:
+Training and RL scripts invoke the VERL Hydra entry points. Plug-and-play and
+one-shot evaluation use `revise/pnp_cli.py` so dataset, backend, and setting
+selection stay in one public command surface.
 
 ```bash
 python3 -m verl.trainer.main_ppo \
   --config-path $(pwd)/revise/config \
   --config-name <config_name> \
-  actor_rollout_ref.rollout.name=sglang \
+  actor_rollout_ref.rollout.name=vllm \
   [hydra overrides ...]
 ```
 
-### Standalone evaluation scripts
-
-These scripts run REVISE plug-and-play evaluation directly via vLLM, independent of the `verl` trainer:
+### Standalone evaluation
 
 ```bash
-python revise/plug_and_play_nextqa_vllm.py           # NExT-QA
-python revise/plug_and_play_egoschema_vllm.py         # EgoSchema
-python revise/plug_and_play_videomme_lvbench_vllm.py  # Video-MME / LVBench
-python revise/plug_and_play_lvbench_hf.py             # LVBench (HF backend)
-python revise/oneshot_lvbench_hf.py                   # One-shot baseline
-python revise/eval_nextqa_caption_vllm.py             # Caption-only baseline
+python revise/pnp_cli.py --dataset lvbench --backend hf_inprocess
+python revise/pnp_cli.py --dataset lvbench --backend vllm_http
+python revise/pnp_cli.py --dataset lvbench --backend vllm_http --setting oneshot_baseline
+python revise/benchmarks/nextqa_caption_vllm.py  # Caption-only baseline
 ```
+
+Use `revise/pnp_cli.py` for plug-and-play and one-shot evaluation. Dataset,
+backend, and setting are separate flags; benchmark-specific scripts are kept
+only where they implement a distinct evaluator such as caption-only NExT-QA.
 
 ## Repository Structure
 
 ```
-revise/            # REVISE evaluation scripts, shell runners, Hydra configs
-  config/          #   YAML configs for eval / GRPO / ablations
+revise/            # REVISE package root and launchers
+  datasets/       # Dataset/sample loaders and task adapters
+  backends/       # Inference runtimes such as vLLM HTTP and HF in-process
+  benchmarks/     # Per-benchmark CLIs and paper-suite entry points
+  run_*.sh        # Hydra launchers for eval, SFT, and GRPO
+  pnp/            # Shared loop engine, protocols, prompts, registry, utilities
+  config/         # YAML configs for eval / GRPO / ablations
 scripts/           # Reproduction tooling: asset download, doctor, paper suite
 tests/             # Unit tests
 
@@ -207,7 +352,7 @@ Agent loop selection: `actor_rollout_ref.rollout.agent.default_agent_loop: revis
 ## Hardware
 
 - Recommended: 4 GPUs with tensor-parallel vLLM/SGLang
-- Experiment tracking via [wandb](https://wandb.ai/) (`trainer.logger='["console","wandb"]'`)
+- Experiment tracking via [wandb](https://wandb.ai/); set `WANDB_API_KEY` in the shell for training
 - Distributed training uses [Ray](https://www.ray.io/) + FSDP
 
 ## License

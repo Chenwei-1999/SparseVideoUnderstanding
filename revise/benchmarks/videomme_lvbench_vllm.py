@@ -11,45 +11,40 @@ recovers a trailing bare letter when no frame request follows the summary.
 Frame indexing is 1-fps timeline based (these are long videos). Run as a CLI
 (see ``main``); invoked by ``scripts/paper_suite.py`` and imported for cache
 coverage checks by ``scripts/check_video_cache_coverage.py`` and
-``scripts/cache_hf_video_benchmark.py``. Shared helpers: ``revise/pnp_utils.py``.
+``scripts/cache_hf_video_benchmark.py``. Shared helpers: ``revise/pnp/utils.py``.
 
 NOTE: this file's ``MCVideoSample`` / loaders intentionally differ from the
-HF-backend variant in ``plug_and_play_lvbench_hf.py`` (this one keeps every row
-and records a ``video_url``; the HF one filters empty answers and carries
-``question_type``/``video_type``). They are deliberately not unified -- see
+cache-only in-process loader in ``revise.datasets.lvbench`` (this one keeps
+every row and records a ``video_url``; the in-process path filters empty answers
+and carries ``question_type``/``video_type``). They are deliberately not unified -- see
 ``tests/test_pnp_characterization.py::LoaderDivergenceTest``.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import random
 import re
-import shutil
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-import requests
 from PIL import Image
 
 # Allow direct execution via `python examples/...py`.
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from revise.pnp_prompts import SYSTEM_PROMPT_WITH_THINK as DEFAULT_SYSTEM_PROMPT_WITH_THINK
-from revise import pnp_harness
-from revise.pnp_protocols import LoopConfig, RunStats
-from revise.pnp_utils import FORCE_ANSWER_INSTRUCTIONS_SIMPLE as _FORCE_ANSWER_INSTRUCTIONS
-from revise.pnp_utils import chat_once as _shared_chat_once
-from revise.pnp_utils import start_vllm_server as _shared_start_vllm_server
-from revise.pnp_utils import (
+from revise.backends.vllm_http import VllmHttpBackend
+from revise.datasets.video_download import download_youtube as _download_youtube
+from revise.pnp import harness as pnp_harness
+from revise.pnp.prompts import SYSTEM_PROMPT as DEFAULT_SYSTEM_PROMPT
+from revise.pnp.protocols import LoopConfig, RunStats
+from revise.pnp.utils import (
     ANSWER_RE,
     SELECT_RE,
     SUMMARIZE_RE,
@@ -62,10 +57,8 @@ from revise.pnp_utils import (
     extract_video_info,
     format_question_block,
     format_videomme_question_block,
-    get_api_headers,
     get_model_id,
     maybe_init_wandb,
-    maybe_log_jsonl,
     normalize_answer_letter,
     parse_int_list,
     parse_options_from_lvbench_question,
@@ -73,15 +66,17 @@ from revise.pnp_utils import (
     pick_free_port,
     propose_candidate_frames,
     resolve_base_url,
-    sample_uniform_indices_inclusive,
-    shard_by_video,
-    stable_sample_id_dataset,
     retry_feedback_text,
+    sample_uniform_indices_inclusive,
+    stable_sample_id_dataset,
     stop_server,
     timeline_len_1fps,
     wait_for_server,
     wandb_log,
 )
+from revise.pnp.utils import FORCE_ANSWER_INSTRUCTIONS_SIMPLE as _FORCE_ANSWER_INSTRUCTIONS
+from revise.pnp.utils import chat_once as _shared_chat_once
+from revise.pnp.utils import start_vllm_server as _shared_start_vllm_server
 
 FINAL_ANSWER_SYSTEM_PROMPT = (
     "You are a multiple-choice video QA assistant. "
@@ -149,55 +144,6 @@ def _chat_once(
         max_edge=384,
         quality=85,
     )
-
-
-def _ensure_yt_dlp(py_bin: str) -> list[str]:
-    """Return command prefix to invoke yt-dlp (binary or `python -m yt_dlp`)."""
-    if shutil.which("yt-dlp"):
-        return ["yt-dlp"]
-    # Fall back to module invocation.
-    return [py_bin, "-m", "yt_dlp"]
-
-
-def _download_youtube(url: str, out_mp4: str, *, py_bin: str, timeout_s: int) -> None:
-    out_mp4_path = Path(out_mp4)
-    out_mp4_path.parent.mkdir(parents=True, exist_ok=True)
-    out_tmpl = str(out_mp4_path.with_suffix("")) + ".%(ext)s"
-
-    # yt-dlp increasingly requires a JS runtime for YouTube extraction. We prefer Node if present.
-    node_path = shutil.which("node")
-    js_runtime_args: list[str] = []
-    if node_path:
-        js_runtime_args = ["--js-runtimes", f"node:{node_path}"]
-
-    cmd = [
-        *_ensure_yt_dlp(py_bin),
-        *js_runtime_args,
-        "--no-playlist",
-        "--merge-output-format",
-        "mp4",
-        "--extractor-args",
-        "youtube:player_client=android",
-        "-f",
-        "best[ext=mp4][height<=480]/best[ext=mp4]/best",
-        "-o",
-        out_tmpl,
-        url,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
-    if proc.returncode != 0:
-        raise RuntimeError(f"yt-dlp failed ({proc.returncode}): {proc.stderr.strip()[:500]}")
-
-    # Find the merged mp4.
-    if out_mp4_path.exists() and out_mp4_path.stat().st_size > 0:
-        return
-    # Sometimes yt-dlp still leaves a different extension; try to locate by stem.
-    candidates = list(out_mp4_path.parent.glob(out_mp4_path.stem + ".*"))
-    for c in candidates:
-        if c.suffix.lower() == ".mp4" and c.stat().st_size > 0:
-            c.rename(out_mp4_path)
-            return
-    raise FileNotFoundError(f"Downloaded file not found for {url} (expected {out_mp4_path})")
 
 
 @dataclass
@@ -344,7 +290,10 @@ def _build_user_text(
         )
         id_map = ", ".join(f"{i+1}->{t}s" for i, t in enumerate(candidate_unseen_frames))
         lines.append(f"Candidate ID -> timeline second: {id_map}")
-        lines.append("In <select>, output ONLY candidate IDs (comma-separated). Do NOT output raw indices when IDs exist.")
+        lines.append(
+            "In <select>, output ONLY candidate IDs (comma-separated). "
+            "Do NOT output raw indices when IDs exist."
+        )
         if require_candidate_frames:
             lines.append("IMPORTANT: You MUST choose frames only from the Candidate IDs.")
     lines.extend(["Current summary:", f"<summarize>{summary}</summarize>", "Frames shown in this round:"])
@@ -459,7 +408,7 @@ class _BaseLongVideoDataset:
         return format_question_block(sample.question, sample.options)
 
     def system_prompt(self, cfg: LoopConfig) -> str:
-        return DEFAULT_SYSTEM_PROMPT_WITH_THINK.format(max_frames_per_round=cfg.max_frames_per_round)
+        return DEFAULT_SYSTEM_PROMPT.format(max_frames_per_round=cfg.max_frames_per_round)
 
     def build_user_text(self, **kwargs: Any) -> str:
         sample = self._current_sample
@@ -487,9 +436,8 @@ class _BaseLongVideoDataset:
         *,
         frame_indices: Optional[list[int]] = None,
     ) -> str:
-        # Single-round baseline prompt; kept byte-identical to the legacy
-        # ``oneshot_videomme_lvbench_vllm._build_user_text``. This adapter
-        # enumerates frames by 1-based ordinal, so ``frame_indices`` is ignored.
+        # Single-round baseline prompt. This adapter enumerates frames by
+        # 1-based ordinal, so ``frame_indices`` is ignored.
         _ = frame_indices
         lines: list[str] = []
         lines.append(question_block)
@@ -686,8 +634,7 @@ class _BaseLongVideoDataset:
     def final_round_instruction(self, cfg: LoopConfig) -> Optional[str]:
         _ = cfg
         return (
-            "This is the final round. You MUST answer now using <think>...</think> then "
-            "<think>...</think> then <answer>LETTER</answer>."
+            "This is the final round. You MUST answer now using <think>...</think> then <answer>LETTER</answer>."
         )
 
     def final_answer_instruction(self, cfg: LoopConfig) -> Optional[str]:
@@ -755,23 +702,6 @@ class LVBenchDataset(_BaseLongVideoDataset):
             if parsed is not None:
                 return parsed
         return 0, max(0, int(frame_count) - 1)
-
-
-class VllmHttpBackend:
-    def __init__(self, restart_server: Optional[Any] = None) -> None:
-        self.restart_server = restart_server
-
-    def chat(self, **kwargs: Any) -> str:
-        try:
-            return _chat_once(**kwargs)
-        except Exception:
-            if self.restart_server is None:
-                raise
-            self.restart_server()
-            return _chat_once(**kwargs)
-
-    def get_model_id(self, base_url: str, model_id: Optional[str] = None) -> str:
-        return get_model_id(base_url, model_id=model_id)
 
 
 def main() -> int:
@@ -970,6 +900,7 @@ def main() -> int:
         max_tokens=args.max_tokens,
         request_timeout_s=args.timeout_s,
         max_retries_per_round=args.max_retries_per_round,
+        min_select_rounds=0,
         strict_actions=False,
         force_final_answer=bool(args.force_final_answer),
         use_candidate_frames=True,
@@ -996,7 +927,8 @@ def main() -> int:
         model_id = get_model_id(base_url, model_id=args.model_id)
 
     backend = VllmHttpBackend(
-        restart_server=_restart_server if (args.restart_server_on_failure and args.start_server) else None
+        restart_server=_restart_server if (args.restart_server_on_failure and args.start_server) else None,
+        chat_fn=_chat_once,
     )
 
     results = pnp_harness.run_eval(

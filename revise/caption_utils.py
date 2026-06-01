@@ -8,7 +8,7 @@ from typing import Any
 import requests
 from PIL import Image
 
-from revise.pnp_utils import (
+from revise.pnp.utils import (
     b64_jpeg,
     extract_frames_1fps,
     extract_video_info,
@@ -16,7 +16,6 @@ from revise.pnp_utils import (
     sample_uniform_indices_inclusive,
     timeline_len_1fps,
 )
-
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 _CAPTION_CACHE: dict[tuple[str, str], dict[int, str]] = {}
@@ -36,7 +35,7 @@ def load_video_captions(captions_dir: str | None, video_id: str) -> dict[int, st
         _CAPTION_CACHE[cache_key] = {}
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             raw = json.loads(f.read())
     except Exception:
         _CAPTION_CACHE[cache_key] = {}
@@ -95,7 +94,12 @@ def _build_caption_messages(indices: list[int], images: list[Image.Image]) -> li
     ]
     for idx, image in zip(indices, images, strict=False):
         content.append({"type": "text", "text": f"\nFrame at {idx} seconds:\n"})
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_jpeg(image, max_edge=384, quality=85)}"}})
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64_jpeg(image, max_edge=384, quality=85)}"},
+            }
+        )
     return content
 
 

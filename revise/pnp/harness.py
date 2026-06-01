@@ -8,15 +8,16 @@ import sys
 import time
 from typing import Any, Optional
 
-import revise.pnp_engine as pnp_engine
-from revise.pnp_protocols import Backend, Dataset, LoopConfig, RunStats
-from revise.pnp_utils import maybe_log_jsonl, shard_by_video, wandb_log as _default_wandb_log
+import revise.pnp.engine as pnp_engine
+from revise.pnp.protocols import Backend, Dataset, LoopConfig, RunStats
+from revise.pnp.utils import maybe_log_jsonl, shard_by_video
+from revise.pnp.utils import wandb_log as _default_wandb_log
 
 
 def _count_file_lines(path: str) -> int:
     if not path or not os.path.exists(path):
         return 0
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         return sum(1 for _ in f)
 
 
@@ -71,7 +72,7 @@ def _long_resume_completed(log_jsonl: str, *, key: str) -> int:
     if not log_jsonl or not os.path.exists(log_jsonl):
         return 0
     seen_samples: set[str] = set()
-    with open(log_jsonl, "r", encoding="utf-8") as f:
+    with open(log_jsonl, encoding="utf-8") as f:
         for line in f:
             try:
                 obj = json.loads(line)
@@ -107,12 +108,20 @@ def _run_nextqa(
         )
 
     resume_completed = 0
+    resume_completed_ids: set[str] = set()
     correct = 0
     total_rounds = 0
     if getattr(args, "resume_from_log", False) and getattr(args, "log_jsonl", None) and os.path.exists(args.log_jsonl):
         resume_loader = getattr(args, "_pnp_load_progress_from_log", None)
         if resume_loader is not None:
-            resume_completed, correct, total_rounds = resume_loader(args.log_jsonl, max_rounds=args.max_rounds)
+            sample_ids = {str(getattr(sample, "sample_id", "")) for sample in samples}
+            try:
+                resume_progress = resume_loader(args.log_jsonl, max_rounds=args.max_rounds, sample_ids=sample_ids)
+            except TypeError:
+                resume_progress = resume_loader(args.log_jsonl, max_rounds=args.max_rounds)
+            resume_completed, correct, total_rounds = resume_progress[:3]
+            if len(resume_progress) >= 4:
+                resume_completed_ids = {str(sample_id) for sample_id in (resume_progress[3] or set())}
             resume_completed = min(resume_completed, len(samples))
 
     stats.processed = resume_completed
@@ -126,7 +135,12 @@ def _run_nextqa(
     run = _maybe_init_run(args, run, run_config)
 
     start_eval = time.time()
-    for sample in samples[resume_completed:]:
+    samples_to_run = (
+        [sample for sample in samples if str(getattr(sample, "sample_id", "")) not in resume_completed_ids]
+        if resume_completed_ids
+        else samples[resume_completed:]
+    )
+    for sample in samples_to_run:
         stats.processed += 1
         try:
             outcome = pnp_engine.run_sample(
@@ -306,7 +320,7 @@ def _run_egoschema(
 
     done_ids: set[str] = set()
     if log_jsonl and getattr(args, "resume_from_log", False) and os.path.exists(log_jsonl):
-        with open(log_jsonl, "r", encoding="utf-8") as f:
+        with open(log_jsonl, encoding="utf-8") as f:
             for line in f:
                 try:
                     rec = json.loads(line)
@@ -489,7 +503,16 @@ def _run_egoschema(
         with open(args.summary_json, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    print(json.dumps({"results": results, "summary_json": getattr(args, "summary_json", None), "log_jsonl": log_jsonl}, indent=2))
+    print(
+        json.dumps(
+            {
+                "results": results,
+                "summary_json": getattr(args, "summary_json", None),
+                "log_jsonl": log_jsonl,
+            },
+            indent=2,
+        )
+    )
     return results
 
 
@@ -512,7 +535,11 @@ def _run_long_vllm(
         raise SystemExit("No samples selected (check --split/--max-samples/--sharding).")
     _auto_suffix_outputs(args)
 
-    resume_completed = _long_resume_completed(getattr(args, "log_jsonl", ""), key="raw_answer") if getattr(args, "resume_from_log", False) else 0
+    resume_completed = (
+        _long_resume_completed(getattr(args, "log_jsonl", ""), key="raw_answer")
+        if getattr(args, "resume_from_log", False)
+        else 0
+    )
     if resume_completed > 0:
         print(f"[resume] detected {resume_completed} completed samples in {args.log_jsonl}")
         samples = samples[resume_completed:]
@@ -685,7 +712,7 @@ def _run_long_vllm(
     return results
 
 
-def _run_lvbench_hf(
+def _run_long_hf(
     samples: list[Any],
     *,
     dataset: Dataset,
@@ -704,7 +731,11 @@ def _run_lvbench_hf(
         raise SystemExit("No samples selected (check --split/--start-idx/--max-samples/--sharding).")
     _auto_suffix_outputs(args)
 
-    resume_completed = _long_resume_completed(getattr(args, "log_jsonl", ""), key="answer_letter") if getattr(args, "resume_from_log", False) else 0
+    resume_completed = (
+        _long_resume_completed(getattr(args, "log_jsonl", ""), key="answer_letter")
+        if getattr(args, "resume_from_log", False)
+        else 0
+    )
     if resume_completed > 0:
         print(f"[resume] detected {resume_completed} completed samples in {args.log_jsonl}")
         samples = samples[resume_completed:]
@@ -717,6 +748,7 @@ def _run_lvbench_hf(
     total_effective_rounds = 0
     total_frames_used = 0
     processed = 0
+    answered = int(resume_completed)
 
     for sample in samples:
         processed += 1
@@ -770,6 +802,7 @@ def _run_lvbench_hf(
             continue
 
         if outcome.answer_letter is not None:
+            answered += 1
             total_rounds += min(outcome.round_idx, int(args.max_rounds))
             total_effective_rounds += outcome.effective_rounds
             total_frames_used += int(outcome.answer_frame_count)
@@ -798,10 +831,10 @@ def _run_lvbench_hf(
             acc_so_far = correct / max(1, processed_global - stats.failed)
             print(
                 f"[{args.dataset}] processed {processed_global} / {len(samples)+resume_completed} | "
-                f"acc={acc_so_far:.4f} failed={stats.failed} invalid={stats.invalid_outputs} calls={stats.total_model_calls}"
+                f"acc={acc_so_far:.4f} failed={stats.failed} invalid={stats.invalid_outputs} "
+                f"calls={stats.total_model_calls}"
             )
 
-    answered = max(0, len(samples) + resume_completed - stats.failed)
     summary = {
         "dataset": args.dataset,
         "split": getattr(args, "_pnp_split", getattr(args, "split", "")),
@@ -838,7 +871,7 @@ def _run_lvbench_hf(
 
 def _oneshot_default_video_path(args: Any, sample: Any) -> str:
     """Video-existence path for the videomme/lvbench one-shot launcher."""
-    cache_dir = getattr(args, "_pnp_oneshot_cache_dir")
+    cache_dir = args._pnp_oneshot_cache_dir
     return str(cache_dir / sample.video_key)
 
 
@@ -920,14 +953,13 @@ def _run_oneshot(
 ) -> dict[str, Any]:
     """Single-round baseline outer loop shared by every one-shot launcher.
 
-    The default behavior reproduces the legacy
-    ``oneshot_videomme_lvbench_vllm`` launcher byte-for-byte: video-existence
-    skip (never downloads), one chat per sample via
-    :func:`pnp_engine.run_sample_oneshot`, and the launcher's own top-level
+    The default behavior covers cache-only long-video one-shot baselines:
+    video-existence skip (never downloads), one chat per sample via
+    :func:`revise.pnp.engine.run_sample_oneshot`, and the long-video top-level
     summary-json schema (NOT nested under ``results``).
 
     Launchers whose log record / summary schema / video-path resolution differ
-    (lvbench_hf, local_mc) override the defaults via ``args`` hooks:
+    (cache-only long-video and local-MC) override the defaults via ``args`` hooks:
 
     * ``_pnp_oneshot_video_path(sample) -> str`` — existence path (default:
       ``cache_dir / sample.video_key``).
@@ -1151,8 +1183,8 @@ def run_eval(
             run=run,
             args=args,
         )
-    if mode == "lvbench_hf":
-        return _run_lvbench_hf(
+    if mode == "long_hf":
+        return _run_long_hf(
             samples,
             dataset=dataset,
             backend=backend,

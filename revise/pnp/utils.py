@@ -1,9 +1,8 @@
 """Shared utility functions for REVISE plug-and-play evaluation scripts.
 
-This module consolidates functions that were previously duplicated across multiple
-standalone evaluation scripts (plug_and_play_nextqa_vllm.py, plug_and_play_egoschema_vllm.py,
-plug_and_play_videomme_lvbench_vllm.py, plug_and_play_lvbench_hf.py, eval_nextqa_caption_vllm.py)
-and the RL agent loop (verl/experimental/agent_loop/revise_agent_loop.py).
+This module consolidates functions shared by the benchmark CLIs under
+``revise/benchmarks/`` and the RL agent loop
+(``verl/experimental/agent_loop/revise_agent_loop.py``).
 """
 
 from __future__ import annotations
@@ -22,17 +21,19 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Optional
 
 import requests
 from PIL import Image
 
+
 def _load_wandb() -> Any:
     """Import wandb lazily, returning None if it is unavailable.
 
     wandb costs ~1.4s to import and is only needed when ``--use-wandb`` is set,
-    so importing it at module load taxed every importer of pnp_utils -- all six
+    so importing it at module load taxed every importer of revise.pnp.utils -- all six
     eval scripts, the whole test suite, ``--help``, and the paper-suite command
     builder -- for a feature most invocations never use. After the first call
     ``import wandb`` is just a cheap sys.modules lookup.
@@ -53,12 +54,43 @@ SUMMARIZE_RE = re.compile(r"<summarize>(.*?)</summarize>", re.DOTALL | re.IGNORE
 SELECT_RE = re.compile(r"<select>(.*?)</select>", re.DOTALL | re.IGNORECASE)
 ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+_REVISE_TAG_RE = re.compile(r"</?(think|summarize|select|answer)>", re.IGNORECASE)
+_STRICT_SELECT_RE = re.compile(
+    r"^\s*<think>(?P<think>.*?)</think>\s*"
+    r"<summarize>(?P<summary>.*?)</summarize>\s*"
+    r"<select>(?P<select>.*?)</select>\s*$",
+    re.DOTALL | re.IGNORECASE,
+)
+_STRICT_ANSWER_RE = re.compile(
+    r"^\s*<think>(?P<think>.*?)</think>\s*"
+    r"<answer>(?P<answer>.*?)</answer>\s*$",
+    re.DOTALL | re.IGNORECASE,
+)
 
 PLACEHOLDER_SET = {"...", "…", "none", "n/a", "na", "null", "unknown", "unsure", "uncertain"}
 
 OPTION_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 _LEADING_OPTION_LABEL_RE = re.compile(r"^[A-Z]\s*[.)]\s*")
+
+TERMINAL_REVISE_INVALID_REASONS = frozenset(
+    {
+        "missing_frames_tag",
+        "empty_frames",
+        "frames_all_seen",
+        "frames_already_seen",
+        "too_many_frames",
+        "frames_out_of_range",
+        "frames_not_in_candidates",
+        "invalid_select_summary",
+        "invalid_answer_summary",
+        "invalid_paper_protocol",
+        "invalid_think",
+        "invalid_answer_letter",
+        "early_answer_disallowed",
+        "final_select_disallowed",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +109,78 @@ def extract_tag(text: str, pattern: re.Pattern[str]) -> Optional[str]:
     if not matches:
         return None
     return matches[-1].group(1).strip()
+
+
+def parse_strict_revise_action(text: str) -> Optional[dict[str, Optional[str]]]:
+    """Parse the exact paper protocol for one REVISE assistant turn.
+
+    Valid turns are exactly one of:
+    - ``<think>...</think><summarize>...</summarize><select>...</select>``
+    - ``<think>...</think><answer>...</answer>``
+
+    Text outside the tags, mixed actions, repeated tags, and nested REVISE tags
+    are rejected. The parser intentionally does not judge semantic quality of
+    the summary or answer; callers validate those fields separately.
+    """
+    raw = text or ""
+    tag_sequence = [m.group(0).lower() for m in _REVISE_TAG_RE.finditer(raw)]
+
+    if tag_sequence == ["<think>", "</think>", "<summarize>", "</summarize>", "<select>", "</select>"]:
+        match = _STRICT_SELECT_RE.match(raw)
+        if match is None:
+            return None
+        return {
+            "kind": "select",
+            "think": match.group("think").strip(),
+            "summary": match.group("summary").strip(),
+            "select": match.group("select").strip(),
+            "answer": None,
+        }
+
+    if tag_sequence == ["<think>", "</think>", "<answer>", "</answer>"]:
+        match = _STRICT_ANSWER_RE.match(raw)
+        if match is None:
+            return None
+        return {
+            "kind": "answer",
+            "think": match.group("think").strip(),
+            "summary": None,
+            "select": None,
+            "answer": match.group("answer").strip(),
+        }
+
+    return None
+
+
+def should_retry_revise_invalid_output(
+    reason: str,
+    *,
+    retry_idx: Optional[int] = None,
+    max_retries_per_round: Optional[int] = None,
+    retries_left: Optional[int] = None,
+    retryable: bool = True,
+) -> bool:
+    """Shared retry gate for invalid REVISE actions.
+
+    PnP uses a per-round ``retry_idx`` loop while the RL agent loop carries a
+    mutable ``retries_left`` counter through the trajectory. This helper keeps
+    the policy identical: retry first when budget remains and the dataset marks
+    the reason retryable; terminal handling happens only after the budget is
+    exhausted.
+    """
+    _ = reason
+    if not retryable:
+        return False
+    if retries_left is not None:
+        return int(retries_left) > 0
+    if retry_idx is None or max_retries_per_round is None:
+        return False
+    return int(retry_idx) < int(max_retries_per_round)
+
+
+def is_terminal_revise_invalid_reason(reason: str) -> bool:
+    """Return whether an exhausted invalid action should terminate strict loops."""
+    return str(reason) in TERMINAL_REVISE_INVALID_REASONS
 
 
 def dedupe_preserve_order(indices: list[int]) -> list[int]:
@@ -146,6 +250,22 @@ def summary_has_ohrpu(summary_text: str) -> bool:
     return all(a < b for a, b in zip(positions, positions[1:], strict=False))
 
 
+def summary_has_stale_boilerplate(summary_text: str, *, seen_count: int) -> bool:
+    """Detect summaries that still claim no evidence after frames were shown."""
+    if not summary_text or int(seen_count or 0) <= 0:
+        return False
+    text = collapse_ws(summary_text).lower()
+    if "has not seen any frames yet" in text:
+        return True
+    if re.search(r"\bhas not seen any (frame|frames|caption|captions) yet\b", text):
+        return True
+    if "no frames yet" in text:
+        return True
+    if "no captions yet" in text:
+        return True
+    return False
+
+
 def contains_banned_example(text: str) -> bool:
     """Detect accidental copying of legacy few-shot example content."""
     t = collapse_ws(text).lower()
@@ -181,10 +301,10 @@ def retry_feedback_text(feedback: str, *, force_answer: bool, force_instructions
 
 
 # Forced-answer instruction strings shared by the launchers' retry nudges.
-# POHR variant (NExT-QA): reminds the model of the P/O/H/U/R summary order.
+# POHR variant (NExT-QA): answer rounds reuse the last committed summary.
 FORCE_ANSWER_INSTRUCTIONS_POHR = (
     "Output ONLY <think>...</think> then <answer>LETTER</answer>. "
-    "In <summarize>, include P/O/H/U/R in that exact order. "
+    "Do NOT include <summarize> on the answer round. "
     "In <answer>, LETTER must be a single option letter (e.g., A/B/C/D/E)."
 )
 # Simple variant (Video-MME / LVBench-HF): no summarize reminder.
@@ -235,7 +355,7 @@ def should_trust_remote_code(model_path: str) -> bool:
     if not os.path.exists(config_path):
         return False
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             config = json.load(f)
     except Exception:
         return False
@@ -274,6 +394,27 @@ def _flatten_chat_content(content: Any) -> str:
         else:
             chunks.append(str(item.get("text") or ""))
     return "".join(chunks)
+
+
+def extract_openai_message_text(message: dict[str, Any]) -> str:
+    """Return parser-visible text from an OpenAI-compatible chat message.
+
+    Some reasoning-capable servers expose hidden thinking in ``reasoning_content``
+    and leave ``content`` as only the final answer. REVISE requires a visible
+    ``<think>`` block, so fold that reasoning back into the text when the model
+    response would otherwise miss it.
+    """
+    content = _flatten_chat_content(message.get("content") or "")
+    reasoning = _flatten_chat_content(message.get("reasoning_content") or "").strip()
+    if not reasoning or "<think" in content.lower():
+        return content
+    if reasoning.lower().startswith("<think"):
+        think_block = reasoning
+    else:
+        think_block = f"<think>{reasoning}</think>"
+    if content:
+        return f"{think_block}\n{content}"
+    return think_block
 
 
 def apply_processor_chat_template(processor: Any, messages: list[dict[str, Any]], **kwargs: Any) -> str:
@@ -356,15 +497,18 @@ def _is_writable_dir(path: str) -> bool:
 
 def ensure_writable_hf_cache(default_home: Any | None = None) -> str:
     """Ensure Hugging Face cache env vars point to writable local storage."""
-    fallback = os.environ.get("REVISE_HF_HOME") or str(
-        default_home or os.path.abspath(os.path.join("data", "revise_assets", "hf_home"))
-    )
+    candidates = [
+        os.environ.get("HF_HOME"),
+        os.environ.get("REVISE_HF_HOME"),
+        str(default_home) if default_home is not None else None,
+        os.path.abspath(os.path.join("data", "revise_assets", "hf_home")),
+        os.path.join(tempfile.gettempdir(), "revise_hf_home"),
+    ]
 
-    hf_home = os.environ.get("HF_HOME")
-    if not hf_home or not _is_writable_dir(hf_home):
-        hf_home = fallback
-        os.environ["HF_HOME"] = hf_home
-        os.makedirs(hf_home, exist_ok=True)
+    hf_home = next((str(path) for path in candidates if path and _is_writable_dir(str(path))), None)
+    if hf_home is None:  # pragma: no cover - tempfile should be writable on supported systems.
+        raise OSError("No writable Hugging Face cache directory found.")
+    os.environ["HF_HOME"] = hf_home
 
     defaults = {
         "HF_HUB_CACHE": os.path.join(hf_home, "hub"),
@@ -375,7 +519,8 @@ def ensure_writable_hf_cache(default_home: Any | None = None) -> str:
         current = os.environ.get(key)
         if not current or not _is_writable_dir(current):
             os.environ[key] = path
-            os.makedirs(path, exist_ok=True)
+            if not _is_writable_dir(path):  # pragma: no cover - guarded by writable HF_HOME.
+                raise OSError(f"No writable Hugging Face cache directory found for {key}.")
     return hf_home
 
 
@@ -476,6 +621,166 @@ def format_frame_list(frames: list[int]) -> str:
     if not frames:
         return "no frames yet"
     return ", ".join(str(int(i)) for i in frames)
+
+
+DEFAULT_INITIAL_SUMMARY = (
+    "P: I will summarize what has been shown so far; "
+    "O: I will record the key observations from the current evidence; "
+    "H: I will update my belief as new evidence arrives; "
+    "U: some key detail may still be unclear; "
+    "R: request more evidence if needed"
+)
+
+
+def default_initial_summary() -> str:
+    """Initial persistent REVISE memory shared by plug-and-play and RL runs."""
+    return DEFAULT_INITIAL_SUMMARY
+
+
+def _ordinal_label(idx: int) -> str:
+    """Excel-style labels for shown-frame ordinals: 0->A, 25->Z, 26->AA."""
+    if idx < 0:
+        return "?"
+    base = len(OPTION_LABELS)
+    n = idx + 1
+    out = ""
+    while n > 0:
+        n -= 1
+        n, rem = divmod(n, base)
+        out = OPTION_LABELS[rem] + out
+    return out
+
+
+def build_revise_user_text(
+    *,
+    question_block: str,
+    summary: str,
+    frame_count: int,
+    round_idx: int,
+    frame_indices: list[int],
+    seen_frames: list[int],
+    render_images: bool = True,
+    hide_seen_frames: bool = False,
+    candidate_unseen_frames: Optional[list[int]] = None,
+    use_candidate_frame_ids: bool = False,
+    require_candidate_frames: bool = False,
+    shown_frame_captions: Optional[list[str]] = None,
+    candidate_id_captions: Optional[list[str]] = None,
+    shown_frame_ts: Optional[list[int]] = None,
+    candidate_id_ts: Optional[list[int]] = None,
+    timestamps: Optional[list[Optional[float]]] = None,
+    use_1fps_timeline: bool = False,
+    time_reference: str = "",
+) -> str:
+    """Render the shared REVISE per-round user prompt.
+
+    PnP and RL both use this prompt policy. Backend adapters decide how to attach
+    images and RL additionally records token/logprob trajectories, but the agent
+    state exposed to the model stays the same.
+    """
+    lines: list[str] = [f"Round {round_idx} / Question:\n{question_block}"]
+    if use_1fps_timeline:
+        lines.append(f"Total frames L = {frame_count} (1 fps timeline).")
+    else:
+        lines.append(f"Total frames L = {frame_count}.")
+    if time_reference:
+        lines.append(f"Relevant time window for this question: {time_reference} (focus on this segment).")
+
+    if hide_seen_frames:
+        lines.append(
+            f"Seen frames: {len(seen_frames)} frames already viewed "
+            "(do NOT request any previously shown frames; follow the selection constraints below)."
+        )
+    else:
+        lines.append(f"Seen frames (already viewed; do NOT request these again): {format_frame_list(seen_frames)}")
+
+    candidate_frames = candidate_unseen_frames or []
+    if candidate_frames and use_candidate_frame_ids:
+        lines.append(
+            "Candidate unseen frames available as IDs (all NEW): "
+            f"choose IDs in [1, {len(candidate_frames)}]."
+        )
+        lines.append(
+            "In <select>, output ONLY candidate IDs (comma-separated). Do NOT output raw frame indices when IDs exist."
+        )
+        if candidate_id_captions:
+            lines.append("Captions for candidate unseen frame IDs (1fps, may be noisy):")
+            for cid, cap in enumerate(candidate_id_captions, start=1):
+                if candidate_id_ts and (cid - 1) < len(candidate_id_ts):
+                    lines.append(f"ID {cid} (t≈{int(candidate_id_ts[cid - 1])}s): {cap}")
+                else:
+                    lines.append(f"ID {cid}: {cap}")
+    else:
+        lines.append(
+            "Allowed unseen frame intervals: choose individual NEW indices in <select>: "
+            f"{format_intervals(unseen_intervals(frame_count, seen_frames))}"
+        )
+        lines.append(
+            "Select syntax: output comma-separated individual integers only, e.g. "
+            "<select>2, 4, 8</select>. Do NOT write ranges like 1-4."
+        )
+        if candidate_frames:
+            prefix = (
+                "Candidate unseen frame intervals to choose individual indices from (REQUIRED, all NEW): "
+                if require_candidate_frames
+                else "Candidate unseen frame intervals to choose individual indices from (optional, all NEW): "
+            )
+            lines.append(prefix + f"{format_intervals(indices_to_intervals(candidate_frames))}")
+            if require_candidate_frames:
+                lines.append(
+                    "In <select>, output ONLY individual indices within the Candidate unseen frame intervals above."
+                )
+
+    lines.extend(["Current summary:", f"<summarize>{summary}</summarize>"])
+
+    if shown_frame_captions:
+        lines.append(
+            "Captions for shown frames (1fps, may be noisy):"
+            if render_images
+            else "Captions shown in this round (1fps, index≈seconds; may be noisy):"
+        )
+        if not render_images:
+            for idx, cap in zip(frame_indices, shown_frame_captions, strict=False):
+                lines.append(f"{int(idx)}s: {cap}")
+        elif shown_frame_ts:
+            for ts, cap in zip(shown_frame_ts, shown_frame_captions, strict=False):
+                lines.append(f"{int(ts)}s: {cap}")
+        else:
+            use_labels = hide_seen_frames or (candidate_frames and use_candidate_frame_ids)
+            if use_labels:
+                for i, cap in enumerate(shown_frame_captions):
+                    lines.append(f"{_ordinal_label(i)}: {cap}")
+            else:
+                for idx, cap in zip(frame_indices, shown_frame_captions, strict=False):
+                    lines.append(f"{idx}: {cap}")
+
+    if render_images:
+        lines.append("Frames shown in this round:")
+        if shown_frame_ts:
+            for ts in shown_frame_ts[: len(frame_indices)]:
+                lines.append(f"Shown frame at t≈{int(ts)}s <image>")
+        elif hide_seen_frames or (candidate_frames and use_candidate_frame_ids):
+            for i, _ in enumerate(frame_indices):
+                lines.append(f"Shown frame {_ordinal_label(i)} <image>")
+        elif timestamps:
+            for idx, ts in zip(frame_indices, timestamps, strict=False):
+                if ts is not None:
+                    lines.append(f"Frame {idx} (t={ts:.2f}s) <image>")
+                else:
+                    lines.append(f"Frame {idx} <image>")
+        else:
+            for idx in frame_indices:
+                lines.append(f"Frame {idx} <image>")
+    elif not shown_frame_captions:
+        lines.append("Caption indices shown in this round:")
+        if hide_seen_frames or (candidate_frames and use_candidate_frame_ids):
+            for i, _ in enumerate(frame_indices):
+                lines.append(f"Shown {_ordinal_label(i)}")
+        else:
+            for idx in frame_indices:
+                lines.append(str(idx))
+
+    return "\n".join(lines)
 
 
 def propose_candidate_frames(frame_count: int, seen: set[int], k: int, rng: random.Random) -> list[int]:
@@ -799,6 +1104,20 @@ def format_question_block(question: str, options: list[str]) -> str:
     return "\n".join(lines)
 
 
+def format_revise_question_block(question: str, choices: list[str]) -> str:
+    """Format the common REVISE multiple-choice question block."""
+    labels = [OPTION_LABELS[i] if i < len(OPTION_LABELS) else str(i) for i in range(len(choices))]
+    lines = [f"Question: {question}", "Options:"]
+    for label, choice in zip(labels, choices, strict=False):
+        lines.append(f"{label}. {choice}")
+    if labels:
+        lines.append(
+            "To answer, output <think>...</think> then <answer>LETTER</answer> "
+            f"(LETTER must be one of: {', '.join(labels)})."
+        )
+    return "\n".join(lines)
+
+
 def clean_videoespresso_option(option: Any) -> str:
     """Match the official VideoEspresso option cleanup before prompting."""
     text = str(option or "").strip()
@@ -847,8 +1166,9 @@ def format_videoespresso_question_block(
     if revise_answer_tags:
         allowed = ", ".join(OPTION_LABELS[i] for i in range(min(len(options), len(OPTION_LABELS))))
         query += (
-            "\nFor this REVISE run, output <summarize>...</summarize> then "
-            f"<answer>LETTER</answer> when answering. LETTER must be one of: {allowed}."
+            "\nFor this REVISE run, output <think>...</think> then "
+            f"<answer>LETTER</answer> when answering. Do not include <summarize> on answer rounds. "
+            f"LETTER must be one of: {allowed}."
         )
     return query
 
@@ -1305,15 +1625,15 @@ def chat_once(
         body = (resp.text or "")[:2000]
         raise RuntimeError(f"vLLM HTTP {resp.status_code}: {body}") from exc
     data = resp.json()
-    return data["choices"][0]["message"]["content"] or ""
+    return extract_openai_message_text(data["choices"][0]["message"])
 
 
 def start_vllm_server(
-    args: "argparse.Namespace",
+    args: argparse.Namespace,
     *,
     image_limit: int,
     cuda_visible_default: str = "0",
-) -> "subprocess.Popen[str]":
+) -> subprocess.Popen[str]:
     """Spawn a ``vllm serve`` subprocess from a launcher's parsed args.
 
     The pure command/env construction lives in :func:`build_vllm_serve_command`;

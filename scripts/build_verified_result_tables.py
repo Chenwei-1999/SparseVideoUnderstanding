@@ -17,7 +17,7 @@ from scripts.collect_run_summaries import _collect_experiment, _metric
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, dict):
         raise TypeError(f"Expected JSON object in {path}")
@@ -27,7 +27,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _iter_jsonl(path: Path):
     if not path.exists():
         return
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -250,7 +250,7 @@ def _markdown_table(rows: list[dict[str, Any]], headers: list[str]) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build verified result tables from completed paper-suite runs.")
-    parser.add_argument("run_dirs", nargs="+", help="Run directories produced by submit_paper_suite_slurm.py.")
+    parser.add_argument("run_dirs", nargs="+", help="Run directories produced by paper_suite.py or a launcher.")
     parser.add_argument("--out-json", default="", help="Optional output JSON path.")
     parser.add_argument("--out-md", default="", help="Optional output Markdown path.")
     args = parser.parse_args()

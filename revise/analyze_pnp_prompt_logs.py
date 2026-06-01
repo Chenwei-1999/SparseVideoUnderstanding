@@ -7,7 +7,6 @@ import glob
 import json
 import re
 from collections import Counter, defaultdict
-from pathlib import Path
 from typing import Any, Optional
 
 _SUMMARIZE_RE = re.compile(r"<summarize>(.*?)</summarize>", re.DOTALL | re.IGNORECASE)
@@ -55,10 +54,19 @@ def _extract_frame_count(user_text: str) -> int:
         return 0
 
 
+def _safe_int(value: Any, default: int = -1) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
 def iter_log_lines(paths: list[str]) -> list[dict[str, Any]]:
     objs: list[dict[str, Any]] = []
     for p in paths:
-        with open(p, "r", encoding="utf-8") as f:
+        with open(p, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -70,27 +78,49 @@ def iter_log_lines(paths: list[str]) -> list[dict[str, Any]]:
     return objs
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--log-glob",
-        required=True,
-        help="Glob for prompts.jsonl files (e.g., '/path/to/run/shard_*/prompts.jsonl')",
-    )
-    ap.add_argument("--max-rounds", type=int, default=5, help="Round budget used in the run.")
-    args = ap.parse_args()
+def _counter_json(counter: Counter[Any]) -> dict[str, int]:
+    return {str(key): int(counter[key]) for key in sorted(counter, key=lambda item: str(item))}
 
-    paths = sorted(glob.glob(args.log_glob))
-    if not paths:
-        raise SystemExit(f"No files matched: {args.log_glob}")
 
-    lines = iter_log_lines(paths)
-    if not lines:
-        raise SystemExit("No JSONL lines found.")
+def _group_prompt_rows(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    if any(row.get("sample_id") for row in rows):
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for idx, row in enumerate(rows):
+            sample_id = str(row.get("sample_id") or f"__missing_sample_id_{idx}")
+            qid = str(row.get("qid") or "")
+            group_key = f"{sample_id}::{qid}" if qid else sample_id
+            grouped[group_key].append(row)
+        return [
+            sorted(
+                sample_rows,
+                key=lambda row: (
+                    int(row.get("round_idx") or 0),
+                    int(row.get("retry_idx") or 0),
+                    float(row.get("ts") or 0.0),
+                ),
+            )
+            for sample_rows in grouped.values()
+        ]
 
-    # Sort by timestamp so sample boundaries are consistent even if shards are merged.
-    lines.sort(key=lambda o: float(o.get("ts") or 0.0))
+    # Legacy logs did not always include a stable sample id. Preserve the old
+    # round-reset boundary inference for that format only.
+    sorted_rows = sorted(rows, key=lambda row: float(row.get("ts") or 0.0))
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for row in sorted_rows:
+        forced = bool(row.get("forced_answer", False))
+        round_idx = int(row.get("round_idx") or 0)
+        if current and round_idx == 1 and not forced:
+            groups.append(current)
+            current = [row]
+        else:
+            current.append(row)
+    if current:
+        groups.append(current)
+    return groups
 
+
+def analyze_prompt_rows(rows: list[dict[str, Any]], *, max_rounds: int) -> dict[str, Any]:
     samples = 0
     answered = 0
     correct = 0
@@ -125,10 +155,7 @@ def main() -> int:
                 continue
             ans_letter = letter
             ans_round = int(obj.get("round_idx") or 0)
-            try:
-                gt_idx = int(obj.get("ground_truth_idx") or -1)
-            except Exception:
-                gt_idx = -1
+            gt_idx = _safe_int(obj.get("ground_truth_idx"), -1)
             break
 
         # Effective rounds: count assistant turns that requested at least one NEW valid frame.
@@ -159,7 +186,7 @@ def main() -> int:
         # Rounds used: if answered, cap by max-rounds; else use last observed round.
         if ans_round is not None:
             answered += 1
-            used = min(int(ans_round), int(args.max_rounds))
+            used = min(int(ans_round), int(max_rounds))
             pred_idx = ord(ans_letter) - ord("A")
             is_correct = int(gt_idx >= 0 and pred_idx == gt_idx)
             correct += is_correct
@@ -173,6 +200,10 @@ def main() -> int:
 
         # No answer => infer termination reason from the last output.
         last = cur[-1]
+        invalid_reason = str(last.get("invalid_reason") or "").strip()
+        if invalid_reason:
+            term_reasons[invalid_reason] += 1
+            return
         raw = str(last.get("raw_output") or "")
         if _extract_tag(raw, _THINK_RE) is None:
             term_reasons["missing_think"] += 1
@@ -194,28 +225,43 @@ def main() -> int:
         else:
             term_reasons["no_answer_but_valid_frames"] += 1
 
-    for obj in lines:
-        forced = bool(obj.get("forced_answer", False))
-        round_idx = int(obj.get("round_idx") or 0)
-        if current and round_idx == 1 and not forced:
-            finalize(current)
-            current = [obj]
-        else:
-            current.append(obj)
-    finalize(current)
+    for current in _group_prompt_rows(rows):
+        finalize(current)
 
     out: dict[str, Any] = {
         "samples": samples,
         "answered": answered,
         "answered_acc": (correct / answered) if answered else 0.0,
         "overall_acc": (correct / samples) if samples else 0.0,
-        "termination_reasons": dict(term_reasons),
-        "rounds_hist": dict(sorted(rounds_hist.items())),
-        "effective_rounds_hist": dict(sorted(effective_rounds_hist.items())),
+        "termination_reasons": _counter_json(term_reasons),
+        "rounds_hist": _counter_json(rounds_hist),
+        "effective_rounds_hist": _counter_json(effective_rounds_hist),
         "acc_by_answer_round": {
-            k: (sum(v) / len(v) if v else 0.0) for k, v in sorted(acc_by_answer_round.items())
+            str(k): (sum(v) / len(v) if v else 0.0) for k, v in sorted(acc_by_answer_round.items())
         },
     }
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--log-glob",
+        required=True,
+        help="Glob for prompts.jsonl files (e.g., '/path/to/run/shard_*/prompts.jsonl')",
+    )
+    ap.add_argument("--max-rounds", type=int, default=5, help="Round budget used in the run.")
+    args = ap.parse_args()
+
+    paths = sorted(glob.glob(args.log_glob))
+    if not paths:
+        raise SystemExit(f"No files matched: {args.log_glob}")
+
+    lines = iter_log_lines(paths)
+    if not lines:
+        raise SystemExit("No JSONL lines found.")
+
+    out = analyze_prompt_rows(lines, max_rounds=args.max_rounds)
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0
 

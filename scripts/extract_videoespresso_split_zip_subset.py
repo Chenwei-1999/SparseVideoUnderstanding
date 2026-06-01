@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PREFIX = "home/work/hsh/MLLM_data/VideoEspresso_train_video/"
 EOCD_SIG = b"PK\x05\x06"
@@ -263,7 +262,9 @@ def _compressed_data_position(parts: list[Path], entry: SplitZipEntry) -> tuple[
         raise RuntimeError(f"Bad local header signature for {entry.name}")
     method = int(values[3])
     if method != entry.compress_type:
-        raise RuntimeError(f"Compression method mismatch for {entry.name}: local={method}, central={entry.compress_type}")
+        raise RuntimeError(
+            f"Compression method mismatch for {entry.name}: local={method}, central={entry.compress_type}"
+        )
     name_len = int(values[9])
     extra_len = int(values[10])
     return _advance_position(parts, entry.disk, entry.local_header_offset, 30 + name_len + extra_len)
@@ -342,7 +343,11 @@ def main() -> int:
         default=os.getenv("REVISE_ASSET_ROOT", str(REPO_ROOT / "data" / "revise_assets")),
     )
     parser.add_argument("--json", required=True, help="VideoEspresso MC/open-ended JSON containing video_path fields.")
-    parser.add_argument("--archive-dir", default=None, help="Directory containing VideoEspresso_train_video.z* and .zip")
+    parser.add_argument(
+        "--archive-dir",
+        default=None,
+        help="Directory containing VideoEspresso_train_video.z* and .zip",
+    )
     parser.add_argument("--out-root", default=None, help="Output root for extracted relative video paths.")
     parser.add_argument("--archive-prefix", default=DEFAULT_PREFIX)
     parser.add_argument("--max-rows", type=int, default=0)
@@ -352,7 +357,11 @@ def main() -> int:
     args = parser.parse_args()
 
     asset_root = Path(args.asset_root).expanduser().resolve()
-    archive_dir = Path(args.archive_dir).expanduser().resolve() if args.archive_dir else asset_root / "VideoEspresso" / "train_video"
+    archive_dir = (
+        Path(args.archive_dir).expanduser().resolve()
+        if args.archive_dir
+        else asset_root / "VideoEspresso" / "train_video"
+    )
     out_root = Path(args.out_root).expanduser().resolve() if args.out_root else archive_dir / "all_video"
     final_zip = archive_dir / "VideoEspresso_train_video.zip"
     json_path = Path(args.json).expanduser().resolve()
@@ -374,7 +383,13 @@ def main() -> int:
         extracted.append(
             {
                 "video_path": rel,
-                **_extract_entry(parts, entry, out_root / rel, overwrite=bool(args.overwrite), dry_run=bool(args.dry_run)),
+                **_extract_entry(
+                    parts,
+                    entry,
+                    out_root / rel,
+                    overwrite=bool(args.overwrite),
+                    dry_run=bool(args.dry_run),
+                ),
             }
         )
 
@@ -389,10 +404,23 @@ def main() -> int:
         "extracted": extracted,
         "dry_run": bool(args.dry_run),
     }
-    manifest_path = Path(args.manifest).expanduser().resolve() if args.manifest else out_root / "extract_subset_manifest.json"
+    manifest_path = (
+        Path(args.manifest).expanduser().resolve() if args.manifest else out_root / "extract_subset_manifest.json"
+    )
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"manifest": str(manifest_path), "requested": len(requested), "matched": len(entries), "missing": len(missing)}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "manifest": str(manifest_path),
+                "requested": len(requested),
+                "matched": len(entries),
+                "missing": len(missing),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     if missing:
         return 1
     return 0

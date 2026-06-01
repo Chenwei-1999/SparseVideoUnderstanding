@@ -240,7 +240,13 @@ def compute_score(
 
     round_bonus = w_effective_round_bonus * float(effective_rounds)
     incorrect_penalty = float(abs(w_incorrect_answer_penalty)) if (format_valid > 0 and answer_correct <= 0) else 0.0
-    score = round_bonus + (w_answer * answer_correct) + (answer_correct * bonus) - (answer_correct * penalty) - incorrect_penalty
+    score = (
+        round_bonus
+        + (w_answer * answer_correct)
+        + (answer_correct * bonus)
+        - (answer_correct * penalty)
+        - incorrect_penalty
+    )
 
     return {
         "score": float(score),

@@ -26,10 +26,16 @@ import json
 import os
 import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from revise.pnp.utils import parse_strict_revise_action  # noqa: E402
 
 
 def has_valid_summary(text: str) -> bool:
@@ -65,13 +71,102 @@ def strip_image_placeholders(text: str) -> str:
     return text.replace("<image>", "[frame]")
 
 
-def build_conversation(rounds: list[dict]) -> list[dict] | None:
+def first_assistant_action(messages: list[dict]) -> str:
+    """Return the first REVISE assistant action in a conversation."""
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        content = str(message.get("content") or "")
+        strict_action = parse_strict_revise_action(content)
+        if strict_action is None:
+            return "other"
+        return str(strict_action["kind"])
+    return "other"
+
+
+def conversation_fingerprint(messages: list[dict]) -> str:
+    """Stable content key for checking train/validation overlap after curation."""
+    return json.dumps(messages, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def rebalance_first_select_ratio(
+    conversations: list[list[dict]],
+    *,
+    min_first_select_ratio: float,
+    seed: int,
+) -> list[list[dict]]:
+    """Oversample Select-first conversations until a minimum first-action ratio is reached.
+
+    The teacher can be correct while still being a poor multi-round teacher if almost every
+    valid trace answers immediately. For SFT, oversampling the scarce valid Select traces is
+    preferable to changing the runtime loop or inventing a second prompt.
+    """
+    target = float(min_first_select_ratio or 0.0)
+    if target <= 0.0 or not conversations:
+        return conversations
+    if not (0.0 < target < 1.0):
+        raise ValueError("--min-first-select-ratio must be in [0, 1).")
+
+    select_conversations = [conv for conv in conversations if first_assistant_action(conv) == "select"]
+    select_count = len(select_conversations)
+    total = len(conversations)
+    current = select_count / max(1, total)
+    if current >= target:
+        return conversations
+    if not select_conversations:
+        print("  WARNING: no Select-first conversations found; cannot rebalance first-action ratio.")
+        return conversations
+
+    import math
+    import random
+
+    needed = int(math.ceil((target * total - select_count) / (1.0 - target)))
+    rng = random.Random(seed)
+    augmented = list(conversations)
+    augmented.extend(rng.choices(select_conversations, k=max(0, needed)))
+    rng.shuffle(augmented)
+    return augmented
+
+
+def teacher_answer_matches_ground_truth(entry: dict, strict_action: dict) -> bool:
+    """Return False when a logged teacher answer contradicts available ground truth."""
+    if "ground_truth_idx" not in entry:
+        return True
+    try:
+        gold_idx = int(entry["ground_truth_idx"])
+    except Exception:
+        return True
+    if gold_idx < 0:
+        return True
+
+    expected = chr(ord("A") + gold_idx)
+    # Validate the actual assistant text that will be learned, not a cached
+    # side-channel field that may be stale.
+    answer = strict_action.get("answer")
+    if not answer:
+        return False
+    answer = str(answer or "").strip().upper()
+    return answer == expected
+
+
+def build_conversation(rounds: list[dict], *, max_rounds: int | None = 4) -> list[dict] | None:
     """Build a chat-format conversation from a list of sorted round entries.
 
     Returns None if any quality check fails.
     """
     if not rounds:
         return None
+    if max_rounds is not None:
+        max_rounds = int(max_rounds)
+        if len(rounds) > max_rounds:
+            return None
+        for entry in rounds:
+            try:
+                round_idx = int(entry.get("round_idx", entry.get("round", 0)))
+            except Exception:
+                return None
+            if round_idx > max_rounds:
+                return None
 
     messages = []
 
@@ -92,14 +187,20 @@ def build_conversation(rounds: list[dict]) -> list[dict] | None:
         if has_template_text(raw_output):
             return None
 
+        strict_action = parse_strict_revise_action(raw_output)
+        if strict_action is None:
+            return None
+
         is_last = i == len(rounds) - 1
         if is_last:
             # Answer round = <think> + <answer> only; no <summarize> required.
-            if not has_valid_answer(raw_output):
+            if strict_action["kind"] != "answer" or not has_valid_answer(raw_output):
+                return None
+            if not teacher_answer_matches_ground_truth(entry, strict_action):
                 return None
         else:
             # Select round = <think> + <summarize> + <select>.
-            if not has_valid_summary(raw_output):
+            if strict_action["kind"] != "select" or not has_valid_summary(raw_output):
                 return None
 
         # Strip image placeholders for text-only SFT
@@ -136,6 +237,22 @@ def main():
     )
     parser.add_argument("--val_ratio", type=float, default=0.05, help="Fraction held out for validation")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for train/val split")
+    parser.add_argument(
+        "--max-rounds",
+        type=int,
+        default=4,
+        help="Reject conversations that exceed the REVISE round budget.",
+    )
+    parser.add_argument(
+        "--min-first-select-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0, oversample valid conversations whose first assistant action is <select> until "
+            "the SFT corpus reaches this minimum ratio. Useful when a local teacher collapses to "
+            "one-round answers."
+        ),
+    )
     args = parser.parse_args()
 
     # 1. Read and group entries by sample_id
@@ -186,7 +303,7 @@ def main():
         # Sort by round_idx/round, then retry_idx (take retry_idx=0 only)
         entries = [e for e in entries if e.get("retry_idx", 0) == 0]
         entries.sort(key=lambda e: int(e.get("round_idx", e.get("round", 0))))
-        conv = build_conversation(entries)
+        conv = build_conversation(entries, max_rounds=args.max_rounds)
         if conv is not None:
             conversations.append(conv)
         else:
@@ -199,7 +316,11 @@ def main():
         print("ERROR: No valid conversations found. Check input file.")
         sys.exit(1)
 
-    # 3. Split train / val
+    all_actions = Counter(first_assistant_action(conv) for conv in conversations)
+    print(f"  First assistant action before split: {dict(all_actions)}")
+
+    # 3. Split train / val before any oversampling so validation remains a held-out
+    # quality check. Rebalancing duplicates training rows only.
     import random
 
     random.seed(args.seed)
@@ -212,6 +333,26 @@ def main():
     val_indices = set(indices[:n_val])
     train_convs = [conversations[i] for i in range(len(conversations)) if i not in val_indices]
     val_convs = [conversations[i] for i in val_indices]
+
+    train_before_actions = Counter(first_assistant_action(conv) for conv in train_convs)
+    val_actions = Counter(first_assistant_action(conv) for conv in val_convs)
+    print(f"  Train first assistant action before rebalance: {dict(train_before_actions)}")
+    print(f"  Val first assistant action: {dict(val_actions)}")
+    train_convs = rebalance_first_select_ratio(
+        train_convs,
+        min_first_select_ratio=args.min_first_select_ratio,
+        seed=args.seed,
+    )
+    train_after_actions = Counter(first_assistant_action(conv) for conv in train_convs)
+    train_select_ratio = train_after_actions.get("select", 0) / max(1, len(train_convs))
+    print(f"  Train first assistant action after rebalance: {dict(train_after_actions)}")
+    print(f"  Train first-select ratio: {train_select_ratio:.3f}")
+
+    train_keys = {conversation_fingerprint(conv) for conv in train_convs}
+    val_keys = {conversation_fingerprint(conv) for conv in val_convs}
+    overlap_count = len(train_keys & val_keys)
+    if overlap_count:
+        print(f"  WARNING: {overlap_count} exact conversations overlap train/val after curation.")
 
     print(f"  Train: {len(train_convs)}, Val: {len(val_convs)}")
 
@@ -231,8 +372,9 @@ def main():
     print(f"  Wrote {val_path} ({len(val_df)} rows)")
 
     # 5. Print stats
-    turn_counts = [len([m for m in c if m["role"] == "assistant"]) for c in conversations]
-    print(f"\nStats:")
+    written_convs = train_convs + val_convs
+    turn_counts = [len([m for m in c if m["role"] == "assistant"]) for c in written_convs]
+    print("\nStats:")
     print(f"  Avg assistant turns per conversation: {sum(turn_counts) / len(turn_counts):.1f}")
     print(f"  Min/Max turns: {min(turn_counts)}/{max(turn_counts)}")
 

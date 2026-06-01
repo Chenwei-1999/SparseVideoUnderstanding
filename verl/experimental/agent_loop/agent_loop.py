@@ -28,6 +28,7 @@ and is designed to be fully replaceable by other agent frameworks such as:
 """
 
 import asyncio
+import heapq
 import logging
 import os
 import random
@@ -39,6 +40,7 @@ import hydra
 import numpy as np
 import ray
 import torch
+from cachetools import LRUCache
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from pydantic import BaseModel, ConfigDict
@@ -70,7 +72,8 @@ from verl.workers.config import (
     RolloutConfig,
 )
 from verl.workers.rollout.llm_server import LLMServerClient
-from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
+from verl.workers.rollout.replica import TokenOutput
+from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -1123,12 +1126,8 @@ class AgentLoopManager:
     async def create(cls, *args, **kwargs):
         """Create agent loop manager."""
         instance = cls(*args, **kwargs)
-        await instance._init_agent_loop_workers()
+        instance._init_agent_loop_workers()
         return instance
-
-        # Initially we're in sleep mode.
-        if self.config.actor_rollout_ref.rollout.free_cache_engine:
-            self.sleep()
 
     def _initialize_llm_servers(self):
         rollout_world_size = (
@@ -1213,12 +1212,6 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
-        # Fix for Issue #4147: Always call wake_up() to ensure weight sync
-        # The wake_up()/sleep() methods internally check free_cache_engine
-        self.wake_up()
-        if self.reward_model_manager:
-            self.reward_model_manager.wake_up()
-
         chunks = prompts.chunk(len(self.agent_loop_workers))
         outputs = ray.get(
             [

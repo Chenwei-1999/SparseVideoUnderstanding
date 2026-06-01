@@ -5,11 +5,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -121,7 +121,7 @@ class LocalMCDataset(Dataset):
         self.processor = processor
         config_map = _to_mapping(config)
 
-        if isinstance(data_files, (list, tuple)):
+        if isinstance(data_files, list | tuple):
             files = [str(x) for x in data_files]
         else:
             files = [str(data_files)]

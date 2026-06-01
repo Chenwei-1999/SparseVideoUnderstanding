@@ -28,7 +28,7 @@ class Dataset(Protocol):
 
     def format_question(self, sample: Any) -> str: ...
 
-    def system_prompt(self, cfg: "LoopConfig") -> str: ...
+    def system_prompt(self, cfg: LoopConfig) -> str: ...
 
     def build_user_text(
         self,
@@ -61,7 +61,7 @@ class Dataset(Protocol):
     ) -> str:
         """Build the single-round (one-shot baseline) user prompt.
 
-        Used only by :func:`revise.pnp_engine.run_sample_oneshot`; the multi-round
+        Used only by :func:`revise.pnp.engine.run_sample_oneshot`; the multi-round
         loop uses :meth:`build_user_text` instead. ``frame_indices`` are the actual
         sampled timeline indices for adapters whose legacy prompt enumerates frames
         by index (e.g. local-MC); adapters that enumerate by ordinal ignore it.
@@ -76,7 +76,7 @@ class Dataset(Protocol):
         rng: random.Random,
     ) -> list[int]: ...
 
-    def initial_frame_indices(self, sample: Any, frame_count: int, cfg: "LoopConfig") -> list[int]: ...
+    def initial_frame_indices(self, sample: Any, frame_count: int, cfg: LoopConfig) -> list[int]: ...
 
     def candidate_frame_indices(
         self,
@@ -88,7 +88,7 @@ class Dataset(Protocol):
         rng: random.Random,
     ) -> list[int]: ...
 
-    def fallback_frame_indices(self, sample: Any, frame_count: int, k: int, cfg: "LoopConfig") -> list[int]: ...
+    def fallback_frame_indices(self, sample: Any, frame_count: int, k: int, cfg: LoopConfig) -> list[int]: ...
 
     def retry_feedback_text(
         self,
@@ -140,11 +140,11 @@ class Dataset(Protocol):
         require_candidate_frames: bool = False,
     ) -> tuple[list[int], Optional[str]]: ...
 
-    def initial_summary(self, cfg: "LoopConfig") -> str: ...
+    def initial_summary(self, cfg: LoopConfig) -> str: ...
 
-    def final_round_instruction(self, cfg: "LoopConfig") -> Optional[str]: ...
+    def final_round_instruction(self, cfg: LoopConfig) -> Optional[str]: ...
 
-    def final_answer_instruction(self, cfg: "LoopConfig") -> Optional[str]: ...
+    def final_answer_instruction(self, cfg: LoopConfig) -> Optional[str]: ...
 
     def forced_answer_request(
         self,
@@ -158,9 +158,9 @@ class Dataset(Protocol):
         last_images: list[Any],
     ) -> tuple[str, str, list[Any]]: ...
 
-    def should_terminate_on_invalid_summary(self, cfg: "LoopConfig") -> bool: ...
+    def should_terminate_on_invalid_summary(self, cfg: LoopConfig) -> bool: ...
 
-    def should_fail_on_empty_images(self, cfg: "LoopConfig") -> bool: ...
+    def should_fail_on_empty_images(self, cfg: LoopConfig) -> bool: ...
 
     def should_count_exhausted_invalid_as_retry(self, reason: str) -> bool: ...
 
@@ -215,6 +215,7 @@ class LoopConfig:
     max_tokens: int
     request_timeout_s: int
     max_retries_per_round: int
+    min_select_rounds: int
     strict_actions: bool
     force_final_answer: bool
     use_candidate_frames: bool
@@ -230,3 +231,4 @@ class LoopConfig:
     log_jsonl: Optional[str]
     seed: int
     fallback_on_invalid_candidate_ids: bool = True
+    strict_paper_protocol: bool = True

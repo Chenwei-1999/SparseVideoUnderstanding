@@ -10,22 +10,39 @@ from typing import Any
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, dict):
         raise TypeError(f"Expected object in {path}")
     return data
 
 
-def _summary_path_from_command(command: str) -> str | None:
+def _summary_paths_from_command(command: str, results_dir: Path) -> list[Path]:
     try:
         parts = shlex.split(command)
     except Exception:
-        return None
+        return []
+    paths: list[Path] = []
+
+    def _resolve(path_text: str) -> Path:
+        path = Path(path_text)
+        return path if path.is_absolute() else results_dir / path
+
     for i, part in enumerate(parts):
         if part == "--summary-json" and i + 1 < len(parts):
-            return parts[i + 1]
-    return None
+            paths.append(_resolve(parts[i + 1]))
+        elif part.startswith("trainer.default_local_dir="):
+            trainer_dir = _resolve(part.removeprefix("trainer.default_local_dir="))
+            paths.extend(
+                [
+                    trainer_dir / "summary.json",
+                    trainer_dir / "trainer_summary.json",
+                    trainer_dir / "validation_summary.json",
+                    trainer_dir / "eval_summary.json",
+                    trainer_dir / "metrics.json",
+                ]
+            )
+    return paths
 
 
 def _metric(results: dict[str, Any], name: str) -> Any:
@@ -55,7 +72,7 @@ def _audit_conversation_log(path: Path) -> dict[str, Any]:
     has_prompt = False
     has_output = False
     has_messages = False
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
@@ -96,10 +113,9 @@ def _audit_conversation_log(path: Path) -> dict[str, Any]:
 def _collect_experiment(exp: dict[str, Any], results_dir: Path) -> dict[str, Any]:
     exp_id = str(exp.get("id") or "")
     command = str(exp.get("command") or "")
-    explicit = _summary_path_from_command(command)
-    summary_path = Path(explicit) if explicit else results_dir / f"{exp_id}.summary.json"
-    if not summary_path.is_absolute():
-        summary_path = results_dir / summary_path
+    candidates = _summary_paths_from_command(command, results_dir)
+    candidates.append(results_dir / f"{exp_id}.summary.json")
+    summary_path = next((path for path in candidates if path.exists()), candidates[0])
 
     row: dict[str, Any] = {
         "id": exp_id,
@@ -173,7 +189,7 @@ def _markdown_table(rows: list[dict[str, Any]]) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Collect paper-suite summary JSON files into one audit table.")
-    parser.add_argument("run_dir", help="Run directory produced by submit_paper_suite_slurm.py.")
+    parser.add_argument("run_dir", help="Run directory produced by paper_suite.py or a launcher.")
     parser.add_argument("--write", action="store_true", help="Write collected_summary.json and collected_summary.md.")
     args = parser.parse_args()
 

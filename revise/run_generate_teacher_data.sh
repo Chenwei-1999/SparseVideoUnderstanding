@@ -19,9 +19,12 @@ set -euo pipefail
 #   MAP_JSON    — vid → vidorID mapping
 #   CSV         — NExT-QA CSV split to use (default: train.csv)
 #   MAX_SAMPLES — max samples (default: 8000, matching the paper-scale SFT set)
+#   MAX_ROUNDS — max REVISE rounds (default: 4, matching NExT-QA Table 4)
+#   MAX_FRAMES_PER_ROUND — max frames per select round (default: 3, matching Table 4)
 #   NUM_SHARDS  — for multi-GPU data-parallel (default: 1)
 #   SHARD_IDX   — shard index (default: 0)
 #   LOG_PATH    — output JSONL path
+#   PORT        — vLLM server port for this shard (default: 18000)
 
 PROJECT_DIR="$(pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -34,6 +37,8 @@ VIDEO_ROOT="${VIDEO_ROOT:-${REVISE_NEXTQA_VIDEO_ROOT:-$ASSET_ROOT/NExT-QA/NExTVi
 MAP_JSON="${MAP_JSON:-${REVISE_NEXTQA_MAP_JSON:-$ASSET_ROOT/NExT-QA/map_vid_vidorID.json}}"
 CSV="${CSV:-${REVISE_NEXTQA_TRAIN_CSV:-$ASSET_ROOT/NExT-QA/nextqa/train.csv}}"
 MAX_SAMPLES="${MAX_SAMPLES:-8000}"
+MAX_ROUNDS="${MAX_ROUNDS:-4}"
+MAX_FRAMES_PER_ROUND="${MAX_FRAMES_PER_ROUND:-3}"
 NUM_SHARDS="${NUM_SHARDS:-1}"
 SHARD_IDX="${SHARD_IDX:-0}"
 LOG_PATH="${LOG_PATH:-$PROJECT_DIR/outputs/nextqa_teacher_train_log.jsonl}"
@@ -41,6 +46,7 @@ TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.55}"
 SERVER_LOG="${SERVER_LOG:-}"
 SERVER_TIMEOUT_S="${SERVER_TIMEOUT_S:-1800}"
+PORT="${PORT:-18000}"
 
 MODEL_ARGS=()
 if [ -n "$TEACHER_BASE_URL" ]; then
@@ -54,6 +60,7 @@ else
     MODEL_ARGS+=(--tensor-parallel-size "$TENSOR_PARALLEL_SIZE")
     MODEL_ARGS+=(--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION")
     MODEL_ARGS+=(--server-timeout-s "$SERVER_TIMEOUT_S")
+    MODEL_ARGS+=(--port "$PORT")
     if [ -n "$TEACHER_MODEL_ID" ]; then
         MODEL_ARGS+=(--model-id "$TEACHER_MODEL_ID")
     fi
@@ -75,20 +82,28 @@ else
 fi
 echo "  CSV:         $CSV"
 echo "  Max samples: $MAX_SAMPLES"
+echo "  Max rounds:  $MAX_ROUNDS"
+echo "  Max frames:  $MAX_FRAMES_PER_ROUND"
 echo "  Log:         $LOG_PATH"
 if [ -z "$TEACHER_BASE_URL" ] && [ -n "$SERVER_LOG" ]; then
     echo "  Server log:  $SERVER_LOG"
 fi
+if [ -z "$TEACHER_BASE_URL" ]; then
+    echo "  Server port: $PORT"
+fi
 echo "  Shards:      $NUM_SHARDS (idx=$SHARD_IDX)"
 
-"$PYTHON_BIN" "$PROJECT_DIR/revise/plug_and_play_nextqa_vllm.py" \
+"$PYTHON_BIN" "$PROJECT_DIR/revise/pnp_cli.py" \
+    --dataset nextqa \
+    --backend vllm_http \
+    --setting multi_round_pnp \
     "${MODEL_ARGS[@]}" \
     --video-root "$VIDEO_ROOT" \
     --map-json "$MAP_JSON" \
     --csv "$CSV" \
     --max-samples "$MAX_SAMPLES" \
-    --max-rounds 5 \
-    --max-frames-per-round 5 \
+    --max-rounds "$MAX_ROUNDS" \
+    --max-frames-per-round "$MAX_FRAMES_PER_ROUND" \
     --log-jsonl "$LOG_PATH" \
     --num-shards "$NUM_SHARDS" \
     --shard-idx "$SHARD_IDX" \

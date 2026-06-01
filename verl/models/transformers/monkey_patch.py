@@ -24,8 +24,8 @@ from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import is_flash_attn_2_available
 
-from verl.utils.import_utils import is_trl_available
 from verl.utils.device import is_torch_npu_available
+from verl.utils.import_utils import is_trl_available
 from verl.utils.transformers_compat import is_transformers_version_in_range
 from verl.utils.ulysses import (
     gather_heads_scatter_seq,

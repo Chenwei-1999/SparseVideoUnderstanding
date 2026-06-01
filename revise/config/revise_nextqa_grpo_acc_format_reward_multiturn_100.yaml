@@ -87,6 +87,7 @@ actor_rollout_ref:
       max_retries_per_round: 0
       initial_sampling: uniform
       include_timestamps: True
+      use_1fps_timeline: True
       terminate_on_invalid_action: True
 
 algorithm:

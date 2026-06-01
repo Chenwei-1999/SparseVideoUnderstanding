@@ -88,6 +88,7 @@ actor_rollout_ref:
       max_retries_per_round: 1
       initial_sampling: uniform
       include_timestamps: True
+      use_1fps_timeline: True
 
 algorithm:
   adv_estimator: grpo

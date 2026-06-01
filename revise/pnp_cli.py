@@ -3,34 +3,80 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
+import sys
+import time
+from pathlib import Path
 from typing import Any
 
-from revise.pnp_protocols import LoopConfig, RunStats
-from revise.pnp_utils import (
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from revise.pnp import harness as pnp_harness
+from revise.pnp.protocols import LoopConfig, RunStats
+from revise.pnp.utils import (
     get_model_id,
     maybe_init_wandb,
     pick_free_port,
     resolve_base_url,
-    wandb_log,
+    shard_by_video,
     wait_for_server,
+    wandb_log,
 )
-from revise import pnp_harness
 
-DATASET_NAMES = ("egoschema", "lvbench", "lvbench_hf", "nextqa", "videoespresso", "videomme")
+DATASET_NAMES = ("egoschema", "lvbench", "nextqa", "videoespresso", "videomme")
+LEGACY_DATASET_ALIASES: dict[str, str] = {}
 BACKEND_NAMES = ("hf_inprocess", "vllm_http")
+LOCAL_MC_DATASETS = {"egoschema", "nextqa", "videoespresso"}
+LONG_VIDEO_DATASETS = {"lvbench", "videomme"}
 
 
 def _resolve(kind: str, name: str) -> type[Any]:
-    from revise.pnp_registry import resolve
+    from revise.pnp.registry import resolve
 
     return resolve(kind, name)
 
 
+def _dataset_name(value: str) -> str:
+    name = str(value).strip().lower()
+    if name in DATASET_NAMES or name in LEGACY_DATASET_ALIASES:
+        return name
+    expected = ", ".join((*DATASET_NAMES, *LEGACY_DATASET_ALIASES))
+    raise argparse.ArgumentTypeError(f"unknown dataset {value!r}; expected one of: {expected}")
+
+
+def _normalize_legacy_dataset_alias(args: argparse.Namespace) -> None:
+    if str(args.dataset).lower() in LEGACY_DATASET_ALIASES:
+        if args.backend != "hf_inprocess":
+            raise ValueError(f"--dataset {args.dataset} is a legacy alias and requires --backend hf_inprocess.")
+        args._legacy_dataset_alias = str(args.dataset).lower()
+        args.dataset = LEGACY_DATASET_ALIASES[args._legacy_dataset_alias]
+
+
+def _apply_setting_defaults(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.setting != "oneshot_baseline":
+        return
+    if bool(getattr(args, "preserve_setting_defaults", False)):
+        return
+    if args.temperature == parser.get_default("temperature"):
+        args.temperature = 0.0
+    if args.top_p == parser.get_default("top_p"):
+        args.top_p = 1.0
+    if args.max_tokens == parser.get_default("max_tokens"):
+        args.max_tokens = 16
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified REVISE plug-and-play evaluator.")
-    parser.add_argument("--dataset", choices=DATASET_NAMES, required=True)
+    parser.add_argument(
+        "--dataset",
+        type=_dataset_name,
+        metavar="{" + ",".join(DATASET_NAMES) + "}",
+        required=True,
+    )
     parser.add_argument("--backend", choices=BACKEND_NAMES, required=True)
     parser.add_argument(
         "--setting",
@@ -65,6 +111,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--max-rounds", type=int, default=5)
     parser.add_argument("--max-frames-per-round", "--max-frames", type=int, default=5)
+    parser.add_argument(
+        "--min-select-rounds",
+        type=int,
+        default=0,
+        help=(
+            "Require this many successful <select> rounds before accepting <answer>; "
+            "default 0 preserves paper early stopping. Positive values are diagnostic ablations only."
+        ),
+    )
     parser.add_argument("--candidate-k", type=int, default=0)
     parser.add_argument("--use-candidate-frames", action="store_true")
     parser.add_argument("--use-candidate-frame-ids", action=argparse.BooleanOptionalAction, default=False)
@@ -75,6 +130,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--max-tokens", "--max-new-tokens", dest="max_tokens", type=int, default=256)
+    parser.add_argument(
+        "--preserve-setting-defaults",
+        action="store_true",
+        help="Do not apply setting-specific decoding overrides; used for paper-comparable one-shot rows.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--force-final-answer", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--answer-only-final-round", action=argparse.BooleanOptionalAction, default=False)
@@ -99,8 +159,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--yt-dlp-timeout-s", type=int, default=600)
     parser.add_argument("--cached-only", action="store_true")
     parser.add_argument("--allow-missing-cached-videos", action="store_true")
-    parser.add_argument("--system-prompt", default="")
-
     parser.add_argument("--use-wandb", action="store_true")
     parser.add_argument("--wandb-project", default=os.getenv("WANDB_PROJECT", "verl-revise"))
     parser.add_argument("--wandb-entity", default=os.getenv("WANDB_ENTITY"))
@@ -122,18 +180,124 @@ def _slice_samples(samples: list[Any], args: argparse.Namespace) -> list[Any]:
     return samples
 
 
+def _suffix_path(path: str, suffix: str) -> str:
+    root, ext = os.path.splitext(path)
+    return f"{root}{suffix}{ext}" if ext else f"{path}{suffix}"
+
+
+def _suffix_sharded_outputs(args: argparse.Namespace) -> None:
+    num_shards = max(1, int(args.num_shards or 1))
+    if num_shards <= 1:
+        return
+    suffix = f".shard{int(args.shard_idx)}of{num_shards}"
+    if args.log_jsonl and suffix not in args.log_jsonl:
+        args.log_jsonl = _suffix_path(args.log_jsonl, suffix)
+    if args.summary_json and suffix not in args.summary_json:
+        args.summary_json = _suffix_path(args.summary_json, suffix)
+
+
+def _clear_outputs_for_fresh_run(args: argparse.Namespace) -> None:
+    if bool(getattr(args, "resume_from_log", False)):
+        return
+    for attr in ("log_jsonl", "summary_json"):
+        path = getattr(args, attr, "") or ""
+        if not path:
+            continue
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _completed_ids_from_log(path: str) -> set[str]:
+    completed: set[str] = set()
+    if not path or not os.path.exists(path):
+        return completed
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            sid = obj.get("sample_id")
+            if sid and obj.get("pred_answer"):
+                completed.add(str(sid))
+    return completed
+
+
+def _filter_cached_long_video_samples(args: argparse.Namespace, samples: list[Any]) -> list[Any]:
+    cache_dir = Path(args.video_cache_dir) / str(args.dataset).lower()
+    args._pnp_oneshot_cache_dir = cache_dir
+    args._pnp_cache_filter_total = len(samples)
+    args._pnp_cache_filter_missing = 0
+    args._pnp_cache_filter_missing_examples = []
+
+    if not bool(args.cached_only):
+        return samples
+
+    filtered: list[Any] = []
+    missing_keys: list[str] = []
+    for sample in samples:
+        path = cache_dir / sample.video_key
+        try:
+            ok = path.stat().st_size > 0
+        except FileNotFoundError:
+            ok = False
+        if ok:
+            filtered.append(sample)
+        else:
+            missing_keys.append(sample.video_key)
+
+    unique_missing = set(missing_keys)
+    args._pnp_cache_filter_missing = len(unique_missing)
+    args._pnp_cache_filter_missing_examples = sorted(unique_missing)[:20]
+    if args._pnp_cache_filter_missing and int(args.max_samples or 0) <= 0 and not args.allow_missing_cached_videos:
+        total_unique = len({s.video_key for s in samples})
+        raise SystemExit(
+            f"--cached-only missing {args._pnp_cache_filter_missing} distinct {args.dataset} videos "
+            f"out of {total_unique}; examples={args._pnp_cache_filter_missing_examples}. "
+            "Populate the cache or pass --allow-missing-cached-videos for an explicitly partial run."
+        )
+    return filtered
+
+
+def _select_samples(args: argparse.Namespace, samples: list[Any]) -> list[Any]:
+    dataset_name = str(args.dataset).lower()
+    if dataset_name in LONG_VIDEO_DATASETS and args.backend == "vllm_http":
+        samples = _filter_cached_long_video_samples(args, samples)
+    samples = _slice_samples(samples, args)
+
+    if args.setting != "oneshot_baseline":
+        return samples
+
+    _suffix_sharded_outputs(args)
+    if dataset_name in LOCAL_MC_DATASETS:
+        samples = shard_by_video(samples, args.num_shards, args.shard_idx, video_key_attr="video_path")
+    elif dataset_name in LONG_VIDEO_DATASETS:
+        samples = shard_by_video(samples, args.num_shards, args.shard_idx)
+        samples.sort(key=lambda s: (s.video_key, s.uid))
+
+    if args.resume_from_log and args.log_jsonl:
+        completed = _completed_ids_from_log(args.log_jsonl)
+        if completed:
+            args._pnp_oneshot_resume_completed = len(completed)
+            samples = [s for s in samples if str(getattr(s, "sample_id", "")) not in completed]
+
+    return samples
+
+
 def _load_samples(args: argparse.Namespace) -> tuple[list[Any], str]:
     dataset_name = str(args.dataset).lower()
     if dataset_name == "nextqa":
         if not (args.csv and args.map_json and args.video_root):
             raise ValueError("--dataset nextqa requires --csv, --map-json, and --video-root.")
-        from revise import plug_and_play_nextqa_vllm as nextqa
+        from revise.datasets.nextqa import load_samples
 
-        samples = nextqa._load_nextqa_samples(
+        samples = load_samples(
             csv_path=args.csv,
             map_json=args.map_json,
             video_root=args.video_root,
-            max_samples=args.max_samples,
+            max_samples=0 if args.setting == "oneshot_baseline" else args.max_samples,
             seed=args.seed or 42,
         )
         return samples, ""
@@ -141,12 +305,12 @@ def _load_samples(args: argparse.Namespace) -> tuple[list[Any], str]:
     if dataset_name in {"egoschema", "videoespresso"}:
         if not (args.json and args.video_root):
             raise ValueError(f"--dataset {dataset_name} requires --json and --video-root.")
-        from revise import plug_and_play_egoschema_vllm as egoschema
+        from revise.datasets.egoschema import load_samples
 
-        samples = egoschema._load_egoschema_samples(
+        samples = load_samples(
             args.json,
             args.video_root,
-            args.max_samples,
+            0 if args.setting == "oneshot_baseline" else args.max_samples,
             args.seed,
             allow_video_download=False,
             egoschema_video_repo="VLM2Vec/egoschema-rawvideo",
@@ -154,20 +318,26 @@ def _load_samples(args: argparse.Namespace) -> tuple[list[Any], str]:
         args.dataset_name = dataset_name
         return samples, ""
 
-    if dataset_name in {"videomme", "lvbench"}:
-        from revise import plug_and_play_videomme_lvbench_vllm as long_vllm
+    if dataset_name == "videomme":
+        split = args.split or "test"
+        if args.backend == "hf_inprocess":
+            from revise.datasets.videomme import load_hf_samples as load_samples
+        else:
+            from revise.datasets.videomme import load_samples
 
-        split = args.split or ("test" if dataset_name == "videomme" else "train")
-        samples = long_vllm._load_videomme_samples(split) if dataset_name == "videomme" else long_vllm._load_lvbench_samples(split)
-        samples = _slice_samples(samples, args)
+        samples = load_samples(split)
         return samples, split
 
-    if dataset_name == "lvbench_hf":
-        from revise import plug_and_play_lvbench_hf as lvbench_hf
-
+    if dataset_name == "lvbench":
         split = args.split or "train"
-        samples = _slice_samples(lvbench_hf._load_lvbench_samples(split), args)
-        args.dataset = "lvbench"
+        if args.backend == "hf_inprocess":
+            from revise.datasets.lvbench import load_hf_samples
+
+            samples = load_hf_samples(split)
+        else:
+            from revise.datasets.lvbench import load_samples
+
+            samples = load_samples(split)
         return samples, split
 
     raise ValueError(f"Unsupported dataset: {args.dataset}")
@@ -175,10 +345,30 @@ def _load_samples(args: argparse.Namespace) -> tuple[list[Any], str]:
 
 def _build_dataset(args: argparse.Namespace, split: str) -> Any:
     dataset_name = str(args.dataset).lower()
-    dataset_cls = _resolve("dataset", "lvbench_hf" if dataset_name == "lvbench" and args.backend == "hf_inprocess" else dataset_name)
+    if args.backend == "hf_inprocess":
+        from revise.datasets.lvbench import DEFAULT_CACHED_LONG_VIDEO_SYSTEM_PROMPT, CachedLongVideoDataset
+
+        dataset_cls = CachedLongVideoDataset
+    else:
+        dataset_key = (
+            "local_mc" if args.setting == "oneshot_baseline" and dataset_name in LOCAL_MC_DATASETS else dataset_name
+        )
+        dataset_cls = _resolve("dataset", dataset_key)
     if dataset_name == "nextqa":
+        if args.setting == "oneshot_baseline":
+            return dataset_cls(
+                dataset_name="nextqa",
+                videoespresso_use_official_prompt=False,
+                videoespresso_with_evidence=False,
+            )
         return dataset_cls()
     if dataset_name in {"egoschema", "videoespresso"}:
+        if args.setting == "oneshot_baseline":
+            return dataset_cls(
+                dataset_name=dataset_name,
+                videoespresso_use_official_prompt=bool(args.videoespresso_use_official_prompt),
+                videoespresso_with_evidence=bool(args.videoespresso_with_evidence),
+            )
         return dataset_cls(
             dataset_name=dataset_name,
             structured_summary=not bool(args.ablate_structured_summary),
@@ -190,7 +380,7 @@ def _build_dataset(args: argparse.Namespace, split: str) -> Any:
         return dataset_cls(
             split=split,
             video_cache_dir=args.video_cache_dir,
-            system_prompt=str(args.system_prompt or ""),
+            system_prompt=DEFAULT_CACHED_LONG_VIDEO_SYSTEM_PROMPT,
             videomme_use_official_prompt=bool(args.videomme_use_official_prompt),
         )
     return dataset_cls(
@@ -203,10 +393,37 @@ def _build_dataset(args: argparse.Namespace, split: str) -> Any:
 
 def _build_loop_config(args: argparse.Namespace) -> LoopConfig:
     dataset_name = str(args.dataset).lower()
+    if args.setting == "oneshot_baseline":
+        return LoopConfig(
+            max_rounds=1,
+            max_frames_per_round=int(args.max_frames_per_round),
+            temperature=float(args.temperature),
+            top_p=float(args.top_p),
+            max_tokens=int(args.max_tokens),
+            request_timeout_s=int(args.request_timeout_s),
+            max_retries_per_round=0,
+            min_select_rounds=0,
+            strict_actions=False,
+            force_final_answer=False,
+            use_candidate_frames=False,
+            candidate_k=None,
+            use_candidate_frame_ids=False,
+            require_candidate_frames=False,
+            answer_only_final_round=False,
+            observation_mode="image",
+            caption_include="none",
+            caption_max_chars=0,
+            captions_dir=None,
+            hide_seen_frames_in_prompt=False,
+            log_jsonl=args.log_jsonl or None,
+            seed=int(args.seed),
+        )
     if dataset_name in {"videomme", "lvbench"}:
         args.use_candidate_frames = True
         if args.candidate_k <= 0:
             args.candidate_k = 20
+        args.use_candidate_frame_ids = True
+        args.require_candidate_frames = True
         strict_actions = False
         fallback = True
     elif dataset_name in {"egoschema", "videoespresso"}:
@@ -229,6 +446,7 @@ def _build_loop_config(args: argparse.Namespace) -> LoopConfig:
         max_tokens=args.max_tokens,
         request_timeout_s=args.request_timeout_s,
         max_retries_per_round=args.max_retries_per_round,
+        min_select_rounds=max(0, int(getattr(args, "min_select_rounds", 0) or 0)),
         strict_actions=strict_actions,
         force_final_answer=bool(args.force_final_answer),
         use_candidate_frames=bool(args.use_candidate_frames),
@@ -247,31 +465,154 @@ def _build_loop_config(args: argparse.Namespace) -> LoopConfig:
     )
 
 
-def _prepare_oneshot_metadata(args: argparse.Namespace, split: str) -> None:
-    """Wire the single-round baseline harness path for videomme/lvbench."""
-    from pathlib import Path
+def _vllm_image_resize_limit(args: argparse.Namespace) -> int:
+    """Return max image edge for vLLM HTTP payloads.
 
+    Local MC benchmarks use a small number of decoded frames and historically
+    sent them without resizing. Long-video benchmarks keep a resize cap to avoid
+    large OpenAI-compatible request payloads.
+    """
+    dataset_name = str(args.dataset).lower()
+    if dataset_name in LOCAL_MC_DATASETS and getattr(args, "observation_mode", "image") == "image":
+        return 0
+    return 384
+
+
+def _assign_vllm_port(args: argparse.Namespace) -> None:
+    """Fill the HTTP port without opening sockets unless we launch vLLM here."""
+    if args.backend != "vllm_http" or args.port > 0:
+        return
+    if args.start_server:
+        args.port = pick_free_port()
+    elif not args.base_url:
+        args.port = 8000
+
+
+def _prepare_oneshot_metadata(args: argparse.Namespace, split: str, dataset_adapter: Any) -> None:
+    """Wire the shared single-round baseline harness path."""
+    dataset_name = str(args.dataset).lower()
     args._pnp_setting = "oneshot_baseline"
     args._pnp_split = split
-    args._pnp_oneshot_cache_dir = Path(args.video_cache_dir) / str(args.dataset).lower()
-    args._pnp_oneshot_resume_completed = 0
-    args._pnp_oneshot_cache_filter_total = 0
-    args._pnp_oneshot_cache_filter_missing = 0
-    args._pnp_oneshot_cache_filter_missing_examples = []
+    args._pnp_oneshot_resume_completed = int(getattr(args, "_pnp_oneshot_resume_completed", 0) or 0)
+    args._pnp_oneshot_cache_dir = getattr(
+        args,
+        "_pnp_oneshot_cache_dir",
+        Path(args.video_cache_dir) / dataset_name,
+    )
+    args._pnp_oneshot_cache_filter_total = int(getattr(args, "_pnp_cache_filter_total", 0) or 0)
+    args._pnp_oneshot_cache_filter_missing = int(getattr(args, "_pnp_cache_filter_missing", 0) or 0)
+    args._pnp_oneshot_cache_filter_missing_examples = list(
+        getattr(args, "_pnp_cache_filter_missing_examples", []) or []
+    )
+    args._pnp_oneshot_skip_missing_video = True
     args._pnp_oneshot_restart_server = None
 
+    if dataset_name not in LOCAL_MC_DATASETS:
+        return
 
-def _prepare_harness_metadata(args: argparse.Namespace, split: str, max_len: int | None = None) -> None:
+    args._pnp_oneshot_skip_missing_video = False
+    args._pnp_oneshot_video_path = lambda sample: sample.video_path
+
+    is_videoespresso_official = bool(dataset_name == "videoespresso" and args.videoespresso_use_official_prompt)
+    is_videoespresso_evidence = bool(dataset_name == "videoespresso" and args.videoespresso_with_evidence)
+
+    def _log_record(
+        sample: Any,
+        *,
+        outcome: Any,
+        pred: str | None,
+        is_correct: bool,
+        video_path: str,
+        split: str,
+    ) -> dict[str, Any]:
+        _ = split, video_path
+        frame_indices = list(outcome.frame_indices)
+        question_block = dataset_adapter.format_question(sample)
+        from revise.datasets.local_mc import build_oneshot_user_text
+
+        user_text = build_oneshot_user_text(question_block, frame_indices)
+        gt = dataset_adapter.ground_truth_letter(sample)
+        return {
+            "ts": time.time(),
+            "dataset": dataset_name,
+            "sample_id": sample.sample_id,
+            "qid": getattr(sample, "qid", ""),
+            "video_path": sample.video_path,
+            "question": sample.question,
+            "options": sample.choices,
+            "task": getattr(sample, "task", ""),
+            "evidence": getattr(sample, "evidence", ""),
+            "system_prompt": "",
+            "user_text": user_text,
+            "messages": [
+                {"role": "system", "content": ""},
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": outcome.raw_output},
+            ],
+            "frame_indices": frame_indices,
+            "pred_answer": pred,
+            "answer_gt": gt,
+            "correct": bool(is_correct),
+            "raw_output": outcome.raw_output,
+            "videoespresso_official_prompt": is_videoespresso_official,
+            "videoespresso_with_evidence": is_videoespresso_evidence,
+        }
+
+    def _build_summary(
+        *,
+        samples_total: int,
+        answered: int,
+        correct: int,
+        failed: int,
+        invalid: int,
+        frames_used: int,
+        elapsed_s: float,
+        stats: RunStats,
+    ) -> dict[str, Any]:
+        _ = invalid
+        return {
+            "task": "oneshot_local_mc",
+            "dataset": dataset_name,
+            "samples": samples_total,
+            "answered": answered,
+            "correct": correct,
+            "accuracy": float(correct / max(1, answered)),
+            "failed": failed,
+            "avg_frames": float(frames_used / max(1, answered)),
+            "elapsed_s": float(elapsed_s),
+            "total_model_calls": stats.total_model_calls,
+            "log_jsonl": args.log_jsonl,
+            "videoespresso_use_official_prompt": bool(args.videoespresso_use_official_prompt)
+            if dataset_name == "videoespresso"
+            else None,
+            "videoespresso_with_evidence": bool(args.videoespresso_with_evidence)
+            if dataset_name == "videoespresso"
+            else None,
+        }
+
+    args._pnp_oneshot_log_record = _log_record
+    args._pnp_oneshot_build_summary = _build_summary
+
+
+def _prepare_harness_metadata(
+    args: argparse.Namespace,
+    split: str,
+    max_len: int | None = None,
+    dataset_adapter: Any | None = None,
+) -> None:
     dataset_name = str(args.dataset).lower()
     args._pnp_maybe_init_wandb = maybe_init_wandb
     args._pnp_wandb_log = wandb_log
     args._pnp_split = split
     args._pnp_max_len = max_len
     if getattr(args, "setting", "multi_round_pnp") == "oneshot_baseline":
-        _prepare_oneshot_metadata(args, split)
+        _prepare_oneshot_metadata(args, split, dataset_adapter)
         return
     if dataset_name == "nextqa":
+        from revise.datasets.nextqa import load_progress_from_log
+
         args._pnp_harness_mode = "nextqa"
+        args._pnp_load_progress_from_log = load_progress_from_log
         args._pnp_run_config = {
             "task": "revise_plug_and_play_nextqa_vllm",
             "dataset_csv": args.csv,
@@ -280,6 +621,10 @@ def _prepare_harness_metadata(args: argparse.Namespace, split: str, max_len: int
             "model_path": args.model_path,
             "engine": "vllm",
             "max_samples": args.max_samples,
+            "max_rounds": args.max_rounds,
+            "max_frames_per_round": args.max_frames_per_round,
+            "max_retries_per_round": args.max_retries_per_round,
+            "min_select_rounds": args.min_select_rounds,
             "num_shards": args.num_shards,
             "shard_idx": args.shard_idx,
         }
@@ -294,18 +639,23 @@ def _prepare_harness_metadata(args: argparse.Namespace, split: str, max_len: int
             "model_path": args.model_path,
             "engine": "vllm",
             "max_samples": args.max_samples,
+            "max_rounds": args.max_rounds,
+            "max_frames_per_round": args.max_frames_per_round,
+            "max_retries_per_round": args.max_retries_per_round,
+            "min_select_rounds": args.min_select_rounds,
             "num_shards": args.num_shards,
             "shard_idx": args.shard_idx,
         }
     elif args.backend == "hf_inprocess":
-        args._pnp_harness_mode = "lvbench_hf"
+        args._pnp_harness_mode = "long_hf"
         args._pnp_run_config = {
-            "task": "revise_plug_and_play_lvbench_hf",
+            "task": "revise_pnp_hf_inprocess",
             "dataset": args.dataset,
             "split": split,
             "model_path": args.model_path,
             "max_rounds": args.max_rounds,
             "max_frames_per_round": args.max_frames_per_round,
+            "min_select_rounds": args.min_select_rounds,
             "candidate_k": args.candidate_k,
             "temperature": args.temperature,
             "top_p": args.top_p,
@@ -320,6 +670,10 @@ def _prepare_harness_metadata(args: argparse.Namespace, split: str, max_len: int
             "model_path": args.model_path,
             "video_cache_dir": args.video_cache_dir,
             "max_samples": args.max_samples,
+            "max_rounds": args.max_rounds,
+            "max_frames_per_round": args.max_frames_per_round,
+            "max_retries_per_round": args.max_retries_per_round,
+            "min_select_rounds": args.min_select_rounds,
             "num_shards": args.num_shards,
             "shard_idx": args.shard_idx,
         }
@@ -328,23 +682,19 @@ def _prepare_harness_metadata(args: argparse.Namespace, split: str, max_len: int
 def main(argv: list[str] | None = None) -> int | None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.backend == "hf_inprocess" and args.dataset != "lvbench_hf":
-        raise ValueError("--backend hf_inprocess is currently supported with --dataset lvbench_hf.")
-    if args.backend == "vllm_http" and args.dataset == "lvbench_hf":
-        raise ValueError("--dataset lvbench_hf requires --backend hf_inprocess.")
-    if args.setting == "oneshot_baseline" and (
-        args.dataset not in {"videomme", "lvbench"} or args.backend != "vllm_http"
-    ):
-        raise ValueError(
-            "--setting oneshot_baseline is supported only with "
-            "--dataset {videomme,lvbench} and --backend vllm_http."
-        )
+    _normalize_legacy_dataset_alias(args)
+    _apply_setting_defaults(args, parser)
+    _clear_outputs_for_fresh_run(args)
+    if args.backend == "hf_inprocess" and args.dataset not in LONG_VIDEO_DATASETS:
+        raise ValueError("--backend hf_inprocess is supported with long-video datasets: lvbench or videomme.")
     if args.base_url and args.start_server:
         raise ValueError("--base-url cannot be combined with --start-server.")
-    if args.port <= 0:
-        args.port = pick_free_port() if args.backend == "vllm_http" else 0
+    _assign_vllm_port(args)
 
     samples, split = _load_samples(args)
+    samples = _select_samples(args, samples)
+    _suffix_sharded_outputs(args)
+    _clear_outputs_for_fresh_run(args)
     if not samples:
         raise RuntimeError("No samples loaded.")
 
@@ -362,17 +712,24 @@ def main(argv: list[str] | None = None) -> int | None:
     try:
         if args.backend == "vllm_http":
             backend_cls = _resolve("backend", "vllm_http")
-            backend = backend_cls()
+            max_edge = _vllm_image_resize_limit(args)
+            backend = backend_cls(max_edge=max_edge, quality=90 if max_edge <= 0 else 85)
             if args.start_server:
-                from revise.pnp_utils import start_vllm_server
+                from revise.pnp.utils import start_vllm_server
 
-                server_proc = start_vllm_server(args)
+                cuda_default = "0" if str(args.dataset).lower() in LONG_VIDEO_DATASETS else "0,1,2,3"
+                server_proc = start_vllm_server(
+                    args,
+                    image_limit=int(args.max_frames_per_round),
+                    cuda_visible_default=cuda_default,
+                )
                 wait_for_server(args.host, args.port, timeout_s=args.server_timeout_s)
             base_url = resolve_base_url(args.base_url, args.host, args.port)
             model_id = get_model_id(base_url, model_id=args.model_id)
         else:
             import torch
-            from revise.plug_and_play_lvbench_hf import _load_model_and_processor
+
+            from revise.backends.hf_inprocess import _load_model_and_processor
 
             device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
             model, processor = _load_model_and_processor(args.model_path, args.dtype, device)
@@ -381,7 +738,7 @@ def main(argv: list[str] | None = None) -> int | None:
             backend = backend_cls(model=model, processor=processor, device=device, max_len=max_len)
             model_id = backend.get_model_id("", model_id=args.model_path)
 
-        _prepare_harness_metadata(args, split, max_len=max_len)
+        _prepare_harness_metadata(args, split, max_len=max_len, dataset_adapter=dataset)
         result = pnp_harness.run_eval(
             samples,
             dataset=dataset,
@@ -394,15 +751,15 @@ def main(argv: list[str] | None = None) -> int | None:
             run=None,
             args=args,
         )
-        if args._pnp_harness_mode in {"egoschema", "long_vllm"}:
+        if getattr(args, "_pnp_harness_mode", "") in {"egoschema", "long_vllm"}:
             if result.get("samples", 0) > 0 and (
                 result.get("failed", 0) >= result.get("samples", 0) or result.get("total_model_calls", 0) == 0
             ):
                 return 2
-        return None if args._pnp_harness_mode == "lvbench_hf" else 0
+        return None if getattr(args, "_pnp_harness_mode", "") == "long_hf" else 0
     finally:
         if server_proc is not None:
-            from revise.pnp_utils import stop_server
+            from revise.pnp.utils import stop_server
 
             stop_server(server_proc)
 

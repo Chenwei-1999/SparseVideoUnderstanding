@@ -12,31 +12,32 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import pandas as pd
 
 # Allow direct execution via `python examples/...py`.
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from revise.pnp_utils import (
+from revise.caption_utils import ensure_video_captions
+from revise.pnp.utils import (
     ANSWER_RE,
+    extract_openai_message_text,
     get_api_headers,
     get_model_id,
     maybe_log_jsonl,
     normalize_video_id,
-    resolve_nextqa_video_path,
     resolve_base_url,
+    resolve_nextqa_video_path,
     should_trust_remote_code,
     stable_sample_id_nextqa,
     stop_server,
     truncate_text,
-    wait_port,
     wait_for_server,
+    wait_port,
 )
-from revise.caption_utils import ensure_video_captions
 
 try:
     import wandb  # type: ignore
@@ -82,7 +83,7 @@ def _chat_once(
     )
     resp.raise_for_status()
     data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    return extract_openai_message_text(data["choices"][0]["message"])
 
 
 def _format_question(question: str, choices: list[str]) -> str:
@@ -165,7 +166,7 @@ def _load_nextqa_samples(
     max_samples: int,
     seed: int,
 ) -> list[NextQASample]:
-    with open(map_json, "r", encoding="utf-8") as f:
+    with open(map_json, encoding="utf-8") as f:
         video_map = json.load(f)
     video_map = {str(k): v for k, v in video_map.items()}
 
@@ -201,7 +202,7 @@ def _load_nextqa_samples(
 
 
 def _start_vllm_server(args: argparse.Namespace) -> subprocess.Popen[str]:
-    # NOTE: deliberately *not* using pnp_utils.build_vllm_serve_command. Caption
+    # NOTE: deliberately *not* using revise.pnp.utils.build_vllm_serve_command. Caption
     # generation streams many frames in a single prompt, so this launcher omits
     # --limit-mm-per-prompt (an image cap would break it) and does not pass
     # --served-model-name. Those omissions are load-bearing, so the command is
@@ -252,7 +253,11 @@ def _start_vllm_server(args: argparse.Namespace) -> subprocess.Popen[str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-path", required=True, help="HF model id or local snapshot path")
-    ap.add_argument("--captions-dir", default=None, help="Optional directory containing <video_id>_cap.json caption files.")
+    ap.add_argument(
+        "--captions-dir",
+        default=None,
+        help="Optional directory containing <video_id>_cap.json caption files.",
+    )
     ap.add_argument(
         "--generated-captions-dir",
         default=str(REPO_ROOT / "outputs" / "generated_captions" / "nextqa"),
@@ -363,6 +368,7 @@ def main() -> int:
                 entity=args.wandb_entity,
                 name=args.wandb_name,
                 group=args.wandb_group,
+                mode=mode,
                 config={
                     "task": "nextqa_caption_only_vllm",
                     "csv": args.csv,
@@ -521,7 +527,7 @@ def main() -> int:
         prompt_log_lines = 0
         prompt_log_bytes = 0
         if args.log_jsonl and os.path.exists(args.log_jsonl):
-            with open(args.log_jsonl, "r", encoding="utf-8") as _f:
+            with open(args.log_jsonl, encoding="utf-8") as _f:
                 prompt_log_lines = sum(1 for _ in _f)
             prompt_log_bytes = os.path.getsize(args.log_jsonl)
 

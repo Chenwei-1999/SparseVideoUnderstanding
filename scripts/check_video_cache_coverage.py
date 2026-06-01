@@ -9,15 +9,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from revise.plug_and_play_videomme_lvbench_vllm import (  # noqa: E402
-    _load_lvbench_samples,
-    _load_videomme_samples,
-)
+from revise.datasets.lvbench import load_samples as load_lvbench_samples  # noqa: E402
+from revise.datasets.videomme import load_samples as load_videomme_samples  # noqa: E402
 
 
 def _dataset_split(dataset: str, split: str) -> str:
@@ -25,7 +22,7 @@ def _dataset_split(dataset: str, split: str) -> str:
 
 
 def _coverage(dataset: str, split: str, cache_root: Path) -> dict[str, Any]:
-    samples = _load_videomme_samples(split) if dataset == "videomme" else _load_lvbench_samples(split)
+    samples = load_videomme_samples(split) if dataset == "videomme" else load_lvbench_samples(split)
     video_keys = sorted({sample.video_key for sample in samples})
     cache_dir = cache_root / dataset
     missing: list[str] = []

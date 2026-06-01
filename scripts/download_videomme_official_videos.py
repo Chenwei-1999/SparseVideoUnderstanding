@@ -10,7 +10,6 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VIDEOMME_REPO = "lmms-lab/Video-MME"
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi"}
@@ -78,7 +77,12 @@ def _extract_videos(zip_path: Path, cache_dir: Path, *, dry_run: bool, overwrite
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download and flatten official Video-MME HF video chunks.")
-    parser.add_argument("--chunk", action="append", default=[], help="Chunk number/range, e.g. 1, 01, 1-4. Default: all.")
+    parser.add_argument(
+        "--chunk",
+        action="append",
+        default=[],
+        help="Chunk number/range, e.g. 1, 01, 1-4. Default: all.",
+    )
     parser.add_argument(
         "--asset-root",
         default=os.getenv("REVISE_ASSET_ROOT", str(REPO_ROOT / "data" / "revise_assets")),
@@ -149,7 +153,13 @@ def main() -> int:
     manifest.parent.mkdir(parents=True, exist_ok=True)
     manifest.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     failed = [entry for entry in report["chunks"] if entry.get("error")]
-    print(json.dumps({"manifest": str(manifest), "chunks": len(chunks), "failed": len(failed)}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {"manifest": str(manifest), "chunks": len(chunks), "failed": len(failed)},
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0 if not failed else 2
 
 

@@ -17,6 +17,7 @@
 /literature/
 # /docs/superpowers/specs/ is tracked (design specs); ephemeral superpowers state lives under /.superpowers/
 /.agents/
+/.claude/
 /.codex/
 /.superpowers/
 /.learnings/
@@ -65,7 +66,7 @@ output.txt
 =0.5.5
 
 # Datasets, media caches, and downloaded assets
-/data/
+/data
 /dataset/
 /datasets/
 /downloads/

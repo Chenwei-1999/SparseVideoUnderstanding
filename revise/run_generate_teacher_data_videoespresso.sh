@@ -64,7 +64,7 @@ if [ -z "$TEACHER_BASE_URL" ] && [ -n "$SERVER_LOG" ]; then
 fi
 echo "  Shards:      $NUM_SHARDS (idx=$SHARD_IDX)"
 
-"$PYTHON_BIN" "$PROJECT_DIR/revise/plug_and_play_egoschema_vllm.py" \
+"$PYTHON_BIN" "$PROJECT_DIR/revise/benchmarks/egoschema_vllm.py" \
     "${MODEL_ARGS[@]}" \
     --dataset-name videoespresso \
     --json "$JSON" \

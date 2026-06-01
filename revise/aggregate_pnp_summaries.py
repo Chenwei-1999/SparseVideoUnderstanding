@@ -54,7 +54,7 @@ def main() -> None:
 
     summaries: list[dict[str, Any]] = []
     for p in paths:
-        with open(p, "r", encoding="utf-8") as f:
+        with open(p, encoding="utf-8") as f:
             summaries.append(json.load(f))
 
     totals = {

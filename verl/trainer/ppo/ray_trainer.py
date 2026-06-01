@@ -1648,7 +1648,9 @@ class RayPPOTrainer:
                                 try:
                                     n_steps = int(batch.batch.batch_size[0])
                                 except Exception:
-                                    n_steps = int(self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n)
+                                    n_steps = int(
+                                        self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
+                                    )
 
                                 prev_coef = float(self.kl_ctrl_in_loss.value)
                                 self.kl_ctrl_in_loss.update(current_kl=float(current_kl), n_steps=n_steps)

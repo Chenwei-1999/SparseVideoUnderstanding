@@ -93,6 +93,7 @@ actor_rollout_ref:
       max_retries_per_round: 0
       initial_sampling: uniform
       include_timestamps: True
+      use_1fps_timeline: True
       terminate_on_invalid_action: True
       # Prompt tweaks to reduce "copy seen frames" illegal actions.
       hide_seen_frames_in_prompt: True

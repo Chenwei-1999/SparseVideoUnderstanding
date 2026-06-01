@@ -15,21 +15,42 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.common import REPO_ROOT, discover_assets
 from scripts.check_video_cache_coverage import _coverage, _dataset_split
-
+from scripts.common import REPO_ROOT, discover_assets
+from scripts.paper_report import (
+    build_report as _build_report_from_catalog,
+)
+from scripts.paper_report import (
+    cmd_to_text,
+)
+from scripts.paper_report import (
+    report_summary_lines as _report_summary_lines,
+)
 
 ExperimentBuilder = Callable[[dict, bool, Path], Union[list, str]]
 ExperimentChecker = Callable[[dict, bool], list]
+NEXTQA_TABLE4_BASE_MODEL_PLACEHOLDER = "<REVISE_NEXTQA_TABLE4_BASE_MODEL>"
 
 
 def _python_bin() -> str:
     return os.getenv("REVISE_PYTHON", sys.executable)
 
 
-def _model_endpoint_args(assets: dict, *, prefer_7b: bool, port: int, server_log: Path | None = None) -> list[str]:
+def _model_endpoint_args(
+    assets: dict,
+    *,
+    prefer_7b: bool,
+    port: int,
+    server_log: Path | None = None,
+    tensor_parallel_size: int = 4,
+    model_path_override: str | None = None,
+    model_id_override: str | None = None,
+) -> list[str]:
     remote = assets["remote_api"]
-    if remote.get("base_url") and remote.get("model_id"):
+    if model_path_override:
+        model_path = model_path_override
+        model_id = model_id_override
+    elif remote.get("base_url") and remote.get("model_id"):
         return [
             "--model-path",
             str(remote["model_id"]),
@@ -38,13 +59,18 @@ def _model_endpoint_args(assets: dict, *, prefer_7b: bool, port: int, server_log
             "--model-id",
             str(remote["model_id"]),
         ]
-    models = assets["models"]
-    model_path = models.get("local_model")
-    model_id = models.get("local_model_id")
-    if not model_path:
-        model_path = models.get("qwen25_vl_7b") if prefer_7b else models.get("qwen25_vl_3b")
-    if not model_path:
-        model_path = models.get("qwen25_vl_3b") or models.get("qwen25_vl_7b")
+    else:
+        models = assets["models"]
+        model_path = models.get("local_model")
+        model_id = models.get("local_model_id")
+        if not model_path:
+            model_path = models.get("qwen35_4b")
+        if not model_path:
+            model_path = models.get("qwen25_vl_7b") if prefer_7b else models.get("qwen25_vl_3b")
+        if not model_path:
+            model_path = models.get("qwen25_vl_3b") or models.get("qwen25_vl_7b")
+        if not model_path:
+            model_path = "Qwen/Qwen2.5-VL-7B-Instruct" if prefer_7b else "Qwen/Qwen2.5-VL-3B-Instruct"
     cmd = [
         "--model-path",
         str(model_path),
@@ -54,7 +80,7 @@ def _model_endpoint_args(assets: dict, *, prefer_7b: bool, port: int, server_log
         "--port",
         str(port),
         "--tensor-parallel-size",
-        "1",
+        str(max(1, int(tensor_parallel_size))),
         "--dtype",
         "bfloat16",
         "--gpu-memory-utilization",
@@ -71,19 +97,105 @@ def _model_endpoint_args(assets: dict, *, prefer_7b: bool, port: int, server_log
     return cmd
 
 
+def _visible_gpu_count(assets: dict) -> Optional[int]:
+    gpu = assets.get("gpu")
+    if not isinstance(gpu, dict):
+        return None
+    count = gpu.get("count")
+    if count is not None:
+        try:
+            return int(count)
+        except Exception:
+            return None
+    if gpu.get("available") is False:
+        return 0
+    raw = str(gpu.get("raw") or "").strip()
+    if raw:
+        return len([line for line in raw.splitlines() if line.strip()])
+    if gpu.get("available") is True:
+        return 1
+    return None
+
+
+def _require_local_gpus(assets: dict, smoke: bool = False, *, allow_remote_api: bool = True) -> list[str]:
+    remote = assets["remote_api"]
+    if allow_remote_api and remote.get("base_url") and remote.get("model_id"):
+        return []
+    required = 1 if smoke else 4
+    visible = _visible_gpu_count(assets)
+    if visible is None:
+        return []
+    if visible < required:
+        plural = "s" if required != 1 else ""
+        hint = (
+            "Configure REVISE_API_BASE_URL/REVISE_MODEL_ID for remote inference or run on a GPU node."
+            if allow_remote_api
+            else "Run on a GPU node with the requested local resources."
+        )
+        return [
+            f"Need {required} visible GPU{plural} for this local run; detected {visible}. "
+            f"{hint}"
+        ]
+    return []
+
+
+def _require_local_vllm_backend(assets: dict, *, allow_remote_api: bool = True) -> list[str]:
+    remote = assets["remote_api"]
+    if allow_remote_api and remote.get("base_url") and remote.get("model_id"):
+        return []
+
+    missing = []
+    packages = assets.get("packages") or {}
+    commands = assets.get("commands") or {}
+    python_path = assets.get("python", {}).get("path") or _python_bin()
+
+    if "vllm" in packages and not packages.get("vllm"):
+        missing.append(
+            "vLLM Python package missing from the selected command environment "
+            f"({python_path}). Install vLLM there or set REVISE_PYTHON to an env that has it."
+        )
+    if "vllm" in commands and not commands.get("vllm"):
+        missing.append(
+            "vLLM CLI missing from the selected command environment. Install vLLM in the REVISE_PYTHON "
+            "environment, or use REVISE_API_BASE_URL/REVISE_MODEL_ID for non-Table-4 remote inference."
+        )
+    return missing
+
+
 def _require_model_or_api(assets: dict, smoke: bool = False) -> list[str]:
+    missing = _require_local_gpus(assets, smoke, allow_remote_api=True)
     remote = assets["remote_api"]
     models = assets["models"]
     if remote.get("base_url") and remote.get("model_id"):
         return []
+    missing += _require_local_vllm_backend(assets, allow_remote_api=False)
+    if missing:
+        return missing
     if models.get("local_model"):
         return []
-    if models.get("qwen25_vl_3b") or models.get("qwen25_vl_7b"):
+    if models.get("qwen35_4b") or models.get("qwen25_vl_3b") or models.get("qwen25_vl_7b"):
         return []
-    return ["No remote OpenAI-compatible API configured and no local Qwen2.5-VL model path found."]
+    # PnP/direct commands intentionally fall back to public Hugging Face model
+    # IDs. That is runnable for open-source users with network/HF cache access;
+    # training checks still require explicit checkpoints where needed.
+    return []
 
 
-def _require_nextqa(assets: dict, smoke: bool = False) -> list[str]:
+def _require_nextqa_table4_base_model(assets: dict, smoke: bool = False) -> list[str]:
+    missing = _require_nextqa_assets(assets, smoke)
+    missing += _require_local_gpus(assets, smoke, allow_remote_api=False)
+    missing += _require_local_vllm_backend(assets, allow_remote_api=False)
+    if not assets["models"].get("nextqa_table4_base"):
+        missing.append(
+            "Set REVISE_NEXTQA_TABLE4_BASE_MODEL to the original Table 4 direct/PnP baseline "
+            "checkpoint. The public Qwen2.5-VL-3B-Instruct fallback is runnable but not paper-comparable "
+            "for Table 4."
+        )
+    return missing
+
+
+def _require_nextqa_assets(assets: dict, smoke: bool = False) -> list[str]:
+    _ = smoke
     nextqa = assets["datasets"]["nextqa"]
     missing = []
     for key in ("video_root", "map_json", "val_csv"):
@@ -92,7 +204,25 @@ def _require_nextqa(assets: dict, smoke: bool = False) -> list[str]:
     val_probe = nextqa.get("val_probe") or {}
     if nextqa.get("video_root") and nextqa.get("map_json") and nextqa.get("val_csv") and not val_probe.get("ok"):
         missing.append(f"NExT-QA validation videos not resolvable ({val_probe.get('reason') or 'unknown reason'}).")
-    return missing + _require_model_or_api(assets)
+    return missing
+
+
+def _require_nextqa_train_assets(assets: dict, smoke: bool = False) -> list[str]:
+    _ = smoke
+    nextqa = assets["datasets"]["nextqa"]
+    missing = []
+    if not nextqa.get("train_csv"):
+        missing.append("NExT-QA train_csv missing")
+    train_probe = nextqa.get("train_probe") or {}
+    if nextqa.get("video_root") and nextqa.get("map_json") and nextqa.get("train_csv") and not train_probe.get("ok"):
+        missing.append(
+            "NExT-QA train videos not resolvable; download/register the official raw train videos before SFT/GRPO."
+        )
+    return missing
+
+
+def _require_nextqa(assets: dict, smoke: bool = False) -> list[str]:
+    return _require_nextqa_assets(assets, smoke) + _require_model_or_api(assets, smoke)
 
 
 def _require_nextqa_captions(assets: dict, smoke: bool = False) -> list[str]:
@@ -207,19 +337,69 @@ def _require_llava_ov_lvbench_cache(assets: dict, smoke: bool = False) -> list[s
     return _require_llava_ov_cache(assets, "lvbench", smoke)
 
 
+def _teacher_override_missing(env_var: str) -> Optional[list[str]]:
+    override = os.getenv(env_var, "").strip()
+    if not override:
+        return None
+    if Path(override).expanduser().is_file():
+        return []
+    return [f"{env_var} points to a missing teacher log: {override}"]
+
+
 def _require_nextqa_training(assets: dict, smoke: bool = False) -> list[str]:
-    missing = _require_nextqa(assets)
-    train_probe = assets["datasets"]["nextqa"].get("train_probe") or {}
-    if not train_probe.get("ok"):
-        missing.append(
-            "NExT-QA train videos not resolvable; download/register the official raw train videos before SFT/GRPO."
-        )
+    missing = _require_nextqa(assets) + _require_nextqa_train_assets(assets, smoke)
     if not assets["models"].get("qwen25_vl_3b"):
         missing.append("Local Qwen2.5-VL-3B checkpoint required for training.")
-    if not assets["models"].get("qwen25_vl_7b") and not assets["models"].get("local_model") and not (
+    teacher_override = _teacher_override_missing("REVISE_NEXTQA_TEACHER_LOG_OVERRIDE")
+    if teacher_override is not None:
+        missing += teacher_override
+    elif not assets["models"].get("qwen25_vl_7b") and not assets["models"].get("local_model") and not (
         assets["remote_api"].get("base_url") and assets["remote_api"].get("model_id")
     ):
         missing.append("Teacher generation needs a local teacher checkpoint or an OpenAI-compatible API endpoint.")
+    return missing
+
+
+def _require_sft_checkpoint_path() -> list[str]:
+    missing = []
+    sft_path = os.getenv("REVISE_NEXTQA_SFT_PATH", "").strip()
+    if not sft_path:
+        missing.append(
+            "REVISE_NEXTQA_SFT_PATH must point to an existing NExT-QA SFT checkpoint "
+            "before running Table 4 SFT evaluation or RL-after-SFT."
+        )
+    else:
+        checkpoint_dir = Path(sft_path).expanduser()
+        if not checkpoint_dir.exists():
+            missing.append(f"REVISE_NEXTQA_SFT_PATH does not exist: {sft_path}")
+        elif not checkpoint_dir.is_dir():
+            missing.append(f"REVISE_NEXTQA_SFT_PATH must point to a Hugging Face checkpoint directory: {sft_path}")
+        else:
+            if not (checkpoint_dir / "config.json").is_file():
+                missing.append(f"REVISE_NEXTQA_SFT_PATH is missing config.json: {sft_path}")
+            has_weights = any(checkpoint_dir.glob("*.safetensors")) or any(checkpoint_dir.glob("*.bin"))
+            if not has_weights:
+                missing.append(
+                    "REVISE_NEXTQA_SFT_PATH is missing model weight files "
+                    f"(*.safetensors or *.bin): {sft_path}"
+                )
+    return missing
+
+
+def _require_nextqa_sft_checkpoint(assets: dict, smoke: bool = False) -> list[str]:
+    missing = _require_nextqa_assets(assets, False)
+    missing += _require_local_gpus(assets, smoke, allow_remote_api=False)
+    missing += _require_local_vllm_backend(assets, allow_remote_api=False)
+    missing += _require_sft_checkpoint_path()
+    return missing
+
+
+def _require_nextqa_rl_after_sft_checkpoint(assets: dict, smoke: bool = False) -> list[str]:
+    _ = smoke
+    missing = _require_nextqa_assets(assets, False) + _require_nextqa_train_assets(assets, False)
+    missing += _require_local_gpus(assets, False, allow_remote_api=False)
+    missing += _require_local_vllm_backend(assets, allow_remote_api=False)
+    missing += _require_sft_checkpoint_path()
     return missing
 
 
@@ -229,7 +409,10 @@ def _require_videoespresso_training(assets: dict, smoke: bool = False) -> list[s
         missing.append("VideoEspresso open-ended train JSON missing.")
     if not assets["models"].get("qwen25_vl_3b"):
         missing.append("Local Qwen2.5-VL-3B checkpoint required for training.")
-    if not assets["models"].get("qwen25_vl_7b") and not assets["models"].get("local_model") and not (
+    teacher_override = _teacher_override_missing("REVISE_VIDEOESPRESSO_TEACHER_LOG_OVERRIDE")
+    if teacher_override is not None:
+        missing += teacher_override
+    elif not assets["models"].get("qwen25_vl_7b") and not assets["models"].get("local_model") and not (
         assets["remote_api"].get("base_url") and assets["remote_api"].get("model_id")
     ):
         missing.append("Teacher generation needs a local teacher checkpoint or an OpenAI-compatible API endpoint.")
@@ -245,11 +428,23 @@ def _cmd_nextqa_pnp_variant(
     max_rounds: int,
     max_frames_per_round: int,
     port: int,
+    max_retries_per_round: int = 0,
+    min_select_rounds: int = 0,
+    prefer_7b: bool = True,
+    model_path_override: str | None = None,
+    model_id_override: str | None = None,
+    emit_min_select_rounds: bool = False,
 ) -> list[str]:
     nextqa = assets["datasets"]["nextqa"]
     cmd = [
         _python_bin(),
-        str(REPO_ROOT / "revise/plug_and_play_nextqa_vllm.py"),
+        str(REPO_ROOT / "revise/pnp_cli.py"),
+        "--dataset",
+        "nextqa",
+        "--backend",
+        "vllm_http",
+        "--setting",
+        "multi_round_pnp",
         "--video-root",
         nextqa["video_root"],
         "--map-json",
@@ -262,18 +457,26 @@ def _cmd_nextqa_pnp_variant(
         "2" if smoke else str(max_rounds),
         "--max-frames-per-round",
         "3" if smoke else str(max_frames_per_round),
+        "--max-retries-per-round",
+        str(max_retries_per_round),
         "--max-samples",
         "1" if smoke else "0",
         "--summary-json",
         str(out_dir / f"{exp_id}.summary.json"),
         "--log-jsonl",
         str(out_dir / f"{exp_id}.jsonl"),
+        "--no-resume-from-log",
     ]
+    if emit_min_select_rounds or int(min_select_rounds or 0) > 0:
+        cmd += ["--min-select-rounds", str(int(min_select_rounds))]
     cmd += _model_endpoint_args(
         assets,
-        prefer_7b=not smoke,
+        prefer_7b=prefer_7b and not smoke,
         port=port,
         server_log=out_dir / f"{exp_id}.server.log",
+        tensor_parallel_size=1 if smoke else 4,
+        model_path_override=model_path_override,
+        model_id_override=model_id_override,
     )
     return cmd
 
@@ -290,7 +493,32 @@ def _cmd_nextqa_pnp(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
     )
 
 
-def _nextqa_pnp_variant_builder(exp_id: str, max_rounds: int, max_frames_per_round: int, port: int) -> ExperimentBuilder:
+def _cmd_nextqa_table4_pnp(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
+    models = assets["models"]
+    model_path = models.get("nextqa_table4_base") or NEXTQA_TABLE4_BASE_MODEL_PLACEHOLDER
+    return _cmd_nextqa_pnp_variant(
+        assets,
+        smoke,
+        out_dir,
+        exp_id="nextqa_table4_pnp",
+        max_rounds=4,
+        max_frames_per_round=3,
+        max_retries_per_round=1,
+        min_select_rounds=0,
+        emit_min_select_rounds=True,
+        port=18000,
+        prefer_7b=False,
+        model_path_override=model_path,
+        model_id_override=models.get("nextqa_table4_base_model_id"),
+    )
+
+
+def _nextqa_pnp_variant_builder(
+    exp_id: str,
+    max_rounds: int,
+    max_frames_per_round: int,
+    port: int,
+) -> ExperimentBuilder:
     return lambda assets, smoke, out_dir: _cmd_nextqa_pnp_variant(
         assets,
         smoke,
@@ -302,13 +530,25 @@ def _nextqa_pnp_variant_builder(exp_id: str, max_rounds: int, max_frames_per_rou
     )
 
 
-def _cmd_nextqa_oneshot(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
+def _cmd_nextqa_oneshot(
+    assets: dict,
+    smoke: bool,
+    out_dir: Path,
+    *,
+    exp_id: str = "nextqa_oneshot",
+    model_path_override: str | None = None,
+    model_id_override: str | None = None,
+) -> list[str]:
     nextqa = assets["datasets"]["nextqa"]
     cmd = [
         _python_bin(),
-        str(REPO_ROOT / "revise/oneshot_local_mc_vllm.py"),
+        str(REPO_ROOT / "revise/pnp_cli.py"),
         "--dataset",
         "nextqa",
+        "--backend",
+        "vllm_http",
+        "--setting",
+        "oneshot_baseline",
         "--video-root",
         nextqa["video_root"],
         "--map-json",
@@ -320,11 +560,43 @@ def _cmd_nextqa_oneshot(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
         "--max-samples",
         "1" if smoke else "0",
         "--summary-json",
-        str(out_dir / "nextqa_oneshot.summary.json"),
+        str(out_dir / f"{exp_id}.summary.json"),
         "--log-jsonl",
-        str(out_dir / "nextqa_oneshot.jsonl"),
+        str(out_dir / f"{exp_id}.jsonl"),
+        "--no-resume-from-log",
     ]
-    cmd += _model_endpoint_args(assets, prefer_7b=False, port=18001, server_log=out_dir / "nextqa_oneshot.server.log")
+    cmd += _model_endpoint_args(
+        assets,
+        prefer_7b=False,
+        port=18001,
+        server_log=out_dir / f"{exp_id}.server.log",
+        tensor_parallel_size=1 if smoke else 4,
+        model_path_override=model_path_override,
+        model_id_override=model_id_override,
+    )
+    return cmd
+
+
+def _cmd_nextqa_table4_direct(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
+    models = assets["models"]
+    model_path = models.get("nextqa_table4_base") or NEXTQA_TABLE4_BASE_MODEL_PLACEHOLDER
+    cmd = _cmd_nextqa_oneshot(
+        assets,
+        smoke,
+        out_dir,
+        exp_id="nextqa_table4_direct",
+        model_path_override=model_path,
+        model_id_override=models.get("nextqa_table4_base_model_id"),
+    )
+    cmd += [
+        "--preserve-setting-defaults",
+        "--temperature",
+        "0.2",
+        "--top-p",
+        "0.9",
+        "--max-tokens",
+        "256",
+    ]
     return cmd
 
 
@@ -332,7 +604,7 @@ def _cmd_nextqa_caption(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
     nextqa = assets["datasets"]["nextqa"]
     cmd = [
         _python_bin(),
-        str(REPO_ROOT / "revise/eval_nextqa_caption_vllm.py"),
+        str(REPO_ROOT / "revise/benchmarks/nextqa_caption_vllm.py"),
         "--video-root",
         nextqa["video_root"],
         "--map-json",
@@ -416,7 +688,7 @@ def _cmd_videoespresso_pnp_variant(
     ve = assets["datasets"]["videoespresso"]
     cmd = [
         _python_bin(),
-        str(REPO_ROOT / "revise/plug_and_play_egoschema_vllm.py"),
+        str(REPO_ROOT / "revise/benchmarks/egoschema_vllm.py"),
         "--dataset-name",
         "videoespresso",
         "--json",
@@ -481,7 +753,7 @@ def _cmd_videoespresso_components_variant(
     ve = assets["datasets"]["videoespresso"]
     cmd = [
         _python_bin(),
-        str(REPO_ROOT / "revise/plug_and_play_egoschema_vllm.py"),
+        str(REPO_ROOT / "revise/benchmarks/egoschema_vllm.py"),
         "--dataset-name",
         "videoespresso",
         "--json",
@@ -537,11 +809,13 @@ def _cmd_videoespresso_oneshot(assets: dict, smoke: bool, out_dir: Path) -> list
     ve = assets["datasets"]["videoespresso"]
     cmd = [
         _python_bin(),
-        str(REPO_ROOT / "revise/oneshot_local_mc_vllm.py"),
+        str(REPO_ROOT / "revise/pnp_cli.py"),
         "--dataset",
-        "jsonmc",
-        "--dataset-name",
         "videoespresso",
+        "--backend",
+        "vllm_http",
+        "--setting",
+        "oneshot_baseline",
         "--json",
         ve["test_json"],
         "--video-root",
@@ -571,7 +845,7 @@ def _cmd_egoschema_pnp(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
     cache_dir = str(Path(assets["asset_root"]) / "EgoSchema" / "videos")
     cmd = [
         _python_bin(),
-        str(REPO_ROOT / "revise/plug_and_play_egoschema_vllm.py"),
+        str(REPO_ROOT / "revise/benchmarks/egoschema_vllm.py"),
         "--dataset-name",
         "egoschema",
         "--max-rounds",
@@ -604,14 +878,19 @@ def _cmd_egoschema_pnp(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
             cache_dir,
             "--auto-download-egoschema-videos",
         ]
-    cmd += _model_endpoint_args(assets, prefer_7b=not smoke, port=18110, server_log=out_dir / "egoschema_pnp.server.log")
+    cmd += _model_endpoint_args(
+        assets,
+        prefer_7b=not smoke,
+        port=18110,
+        server_log=out_dir / "egoschema_pnp.server.log",
+    )
     return cmd
 
 
 def _cmd_videomme_pnp(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
     cmd = [
         _python_bin(),
-        str(REPO_ROOT / "revise/plug_and_play_videomme_lvbench_vllm.py"),
+        str(REPO_ROOT / "revise/benchmarks/videomme_lvbench_vllm.py"),
         "--dataset",
         "videomme",
         "--cached-only",
@@ -636,7 +915,7 @@ def _cmd_videomme_pnp(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
 def _cmd_lvbench_pnp(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
     cmd = [
         _python_bin(),
-        str(REPO_ROOT / "revise/plug_and_play_videomme_lvbench_vllm.py"),
+        str(REPO_ROOT / "revise/benchmarks/videomme_lvbench_vllm.py"),
         "--dataset",
         "lvbench",
         "--cached-only",
@@ -660,9 +939,11 @@ def _cmd_lvbench_pnp(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
 def _cmd_videomme_pnp_hf(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
     cmd = [
         _python_bin(),
-        str(REPO_ROOT / "revise/plug_and_play_lvbench_hf.py"),
+        str(REPO_ROOT / "revise/pnp_cli.py"),
         "--dataset",
         "videomme",
+        "--backend",
+        "hf_inprocess",
         "--max-samples",
         "1" if smoke else "0",
         "--max-rounds",
@@ -687,9 +968,11 @@ def _cmd_videomme_pnp_hf(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
 def _cmd_lvbench_pnp_hf(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
     cmd = [
         _python_bin(),
-        str(REPO_ROOT / "revise/plug_and_play_lvbench_hf.py"),
+        str(REPO_ROOT / "revise/pnp_cli.py"),
         "--dataset",
         "lvbench",
+        "--backend",
+        "hf_inprocess",
         "--max-samples",
         "1" if smoke else "0",
         "--max-rounds",
@@ -713,9 +996,13 @@ def _cmd_lvbench_pnp_hf(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
 def _cmd_videomme_oneshot(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
     cmd = [
         _python_bin(),
-        str(REPO_ROOT / "revise/oneshot_videomme_lvbench_vllm.py"),
+        str(REPO_ROOT / "revise/pnp_cli.py"),
         "--dataset",
         "videomme",
+        "--backend",
+        "vllm_http",
+        "--setting",
+        "oneshot_baseline",
         "--cached-only",
         "--max-samples",
         "1" if smoke else "0",
@@ -734,9 +1021,13 @@ def _cmd_videomme_oneshot(assets: dict, smoke: bool, out_dir: Path) -> list[str]
 def _cmd_lvbench_oneshot(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
     cmd = [
         _python_bin(),
-        str(REPO_ROOT / "revise/oneshot_videomme_lvbench_vllm.py"),
+        str(REPO_ROOT / "revise/pnp_cli.py"),
         "--dataset",
         "lvbench",
+        "--backend",
+        "vllm_http",
+        "--setting",
+        "oneshot_baseline",
         "--cached-only",
         "--max-samples",
         "1" if smoke else "0",
@@ -773,6 +1064,110 @@ def _cmd_nextqa_hydra_resolve(assets: dict, smoke: bool, out_dir: Path) -> list[
     ]
 
 
+def _cmd_nextqa_table4_sft_eval(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
+    model_path = os.getenv(
+        "REVISE_NEXTQA_SFT_PATH",
+        str(out_dir / "checkpoints" / "nextqa_sft" / "hf_model"),
+    )
+    return _cmd_nextqa_pnp_variant(
+        assets,
+        smoke,
+        out_dir,
+        exp_id="nextqa_table4_sft",
+        max_rounds=4,
+        max_frames_per_round=3,
+        max_retries_per_round=1,
+        min_select_rounds=0,
+        emit_min_select_rounds=True,
+        port=18002,
+        prefer_7b=False,
+        model_path_override=model_path,
+    )
+
+
+def _cmd_nextqa_table4_rl_after_sft(assets: dict, smoke: bool, out_dir: Path) -> list[str]:
+    nextqa = assets["datasets"]["nextqa"]
+    sft_path = os.getenv(
+        "REVISE_NEXTQA_SFT_PATH",
+        str(out_dir / "checkpoints" / "nextqa_sft" / "hf_model"),
+    )
+    steps = 1 if smoke else 100
+    train_bsz = 4 if smoke else 8
+    rollout_n = 1 if smoke else 4
+    mini_bsz = train_bsz
+    logger = '["console"]' if smoke else '["console","wandb"]'
+    checkpoint_dir = os.getenv(
+        "REVISE_NEXTQA_RL_CKPT_DIR",
+        str(out_dir / "checkpoints" / "nextqa_table4_grpo_after_sft"),
+    )
+    return [
+        _python_bin(),
+        str(REPO_ROOT / "scripts/run_nextqa_table4_rl_after_sft.py"),
+        "--python-bin",
+        _python_bin(),
+        "--video-root",
+        nextqa["video_root"],
+        "--map-json",
+        nextqa["map_json"],
+        "--train-csv",
+        nextqa["train_csv"],
+        "--val-csv",
+        nextqa["val_csv"],
+        "--sft-path",
+        sft_path,
+        "--output-dir",
+        str(out_dir),
+        "--checkpoint-dir",
+        checkpoint_dir,
+        "--steps",
+        str(steps),
+        "--train-batch-size",
+        str(train_bsz),
+        "--ppo-mini-batch-size",
+        str(mini_bsz),
+        "--rollout-n",
+        str(rollout_n),
+        "--lambda-conf",
+        "1.0",
+        "--lambda-sum",
+        "1.0",
+        "--lambda-stop",
+        "0.5",
+        "--gamma",
+        "0.99",
+        "--format-reward",
+        "0.05",
+        "--stop-round-threshold",
+        "2",
+        "--stop-bonus-beta",
+        "0.0",
+        "--n-gpus",
+        "4",
+        "--rollout-tensor-parallel-size",
+        "4",
+        "--eval-tensor-parallel-size",
+        "1" if smoke else "4",
+        "--max-rounds",
+        "2" if smoke else "4",
+        "--max-frames-per-round",
+        "3",
+        "--max-retries-per-round",
+        "1",
+        "--min-select-rounds",
+        "0",
+        "--max-samples",
+        "1" if smoke else "0",
+        "--summary-json",
+        str(out_dir / "nextqa_table4_rl_after_sft.summary.json"),
+        "--log-jsonl",
+        str(out_dir / "nextqa_table4_rl_after_sft.jsonl"),
+        "--server-log",
+        str(out_dir / "nextqa_table4_rl_after_sft.server.log"),
+        "--logger-json",
+        logger,
+    ]
+
+
 def _shell_env(**items: str) -> str:
     return " ".join(f"{key}={shlex.quote(str(value))}" for key, value in items.items() if value is not None)
 
@@ -800,10 +1195,10 @@ def _external_teacher_step(env_var: str, teacher_log: Path) -> str | None:
     the SFT step expects, replacing the inline teacher-generation step.
 
     Use case (Phase A -> Phase E handoff): Phase A produces a high-quality
-    teacher JSONL via a separately-submitted Slurm job (e.g. Qwen2.5-VL-72B
-    AWQ). Phase E should consume that JSONL instead of re-running teacher
-    generation inline at a smaller model size. Setting REVISE_*_TEACHER_LOG_OVERRIDE
-    when invoking paper_suite.py (or submit_paper_suite_slurm.py) plumbs the
+    teacher JSONL in a separate local or remote run (for example with a larger
+    Qwen2.5-VL-72B teacher). Phase E should consume that JSONL instead of
+    re-running teacher generation inline at a smaller model size. Setting
+    REVISE_*_TEACHER_LOG_OVERRIDE when invoking paper_suite.py plumbs the
     Phase A artifact in.
 
     Returns the substitute shell command, or None if the env var is unset.
@@ -813,7 +1208,7 @@ def _external_teacher_step(env_var: str, teacher_log: Path) -> str | None:
         return None
     override_path = Path(override)
     parent = teacher_log.parent
-    # Fail loudly at sbatch-run time if the override path is missing — we
+    # Fail loudly at run time if the override path is missing — we
     # would otherwise silently train on no data. ln -sfn (no-dereference)
     # so a re-render after Phase A reruns updates the link.
     return (
@@ -880,7 +1275,7 @@ def _manual_nextqa_pipeline(assets: dict, smoke: bool, out_dir: Path) -> str:
             LOG_PATH=str(teacher_log),
             SERVER_LOG=str(teacher_server_log),
             SERVER_TIMEOUT_S="1800",
-            TENSOR_PARALLEL_SIZE="1",
+            TENSOR_PARALLEL_SIZE=n_gpus,
             GPU_MEMORY_UTILIZATION="0.55",
             **_teacher_env(assets),
         )
@@ -920,7 +1315,9 @@ def _manual_nextqa_pipeline(assets: dict, smoke: bool, out_dir: Path) -> str:
 def _manual_videoespresso_pipeline(assets: dict, smoke: bool, out_dir: Path) -> str:
     ve = assets["datasets"]["videoespresso"]
     python_bin = _python_bin()
-    mc_json = str(out_dir / "prepared" / ("videoespresso_train_mc_smoke.json" if smoke else "videoespresso_train_mc.json"))
+    mc_json = str(
+        out_dir / "prepared" / ("videoespresso_train_mc_smoke.json" if smoke else "videoespresso_train_mc.json")
+    )
     teacher_log = out_dir / "teacher_logs" / (
         "videoespresso_teacher_smoke.jsonl" if smoke else "videoespresso_teacher.jsonl"
     )
@@ -996,7 +1393,7 @@ def _manual_videoespresso_pipeline(assets: dict, smoke: bool, out_dir: Path) -> 
                     LOG_PATH=str(teacher_log),
                     SERVER_LOG=str(teacher_server_log),
                     SERVER_TIMEOUT_S="1800",
-                    TENSOR_PARALLEL_SIZE="1",
+                    TENSOR_PARALLEL_SIZE=n_gpus,
                     GPU_MEMORY_UTILIZATION="0.55",
                     **_teacher_env(assets),
                 )
@@ -1065,11 +1462,11 @@ def _lvbench_reward_ablation_builder(config_name: str, exp_label: str):
             f"trainer.default_local_dir={shlex.quote(str(ckpt_dir))}"
         )
         # Note: smoke-run path is intentionally omitted. Reward-ablation
-        # GRPO is run_supported=False — it must be launched through Slurm,
-        # not subprocess.run from paper_suite. A partial smoke override
-        # here would mislead readers into thinking `--smoke` produces a
-        # cheap dry-run, when it would still request the full 4-GPU
-        # tensor-parallel allocation declared in the YAML.
+        # GRPO is run_supported=False because these ablation rows are full
+        # training jobs, not paper_suite subprocess smoke tests. A partial
+        # smoke override here would mislead readers into thinking `--smoke`
+        # produces a cheap dry-run, when it would still request the full
+        # 4-GPU tensor-parallel allocation declared in the YAML.
         _ = smoke  # silence unused-arg lint without changing the signature
         # Env vars are prefixed inline to the python invocation (single command)
         # so they actually apply to the trainer; do not separate with && or they
@@ -1081,6 +1478,53 @@ def _lvbench_reward_ablation_builder(config_name: str, exp_label: str):
 
 
 EXPERIMENTS: dict[str, dict[str, object]] = {
+    "nextqa_table4_direct": {
+        "title": "Table 4 NExT-QA direct reasoning row",
+        "paper_ref": "paper Table 4 / overleaf/tables/RL Results.tex",
+        "paper_metrics": {"acc_pct": 23.6, "frames": 8.0, "rounds": 1.00, "time_s": 0.88},
+        "setting_note": (
+            "Requires the original Table 4 baseline checkpoint via REVISE_NEXTQA_TABLE4_BASE_MODEL. "
+            "Current public Qwen2.5-VL-3B-Instruct probes are much stronger than the paper target "
+            "and should be treated as audit-only."
+        ),
+        "check": _require_nextqa_table4_base_model,
+        "build": _cmd_nextqa_table4_direct,
+        "run_supported": True,
+    },
+    "nextqa_table4_pnp": {
+        "title": "Table 4 NExT-QA plug-and-play row",
+        "paper_ref": "paper Table 4 / overleaf/tables/RL Results.tex",
+        "paper_metrics": {"acc_pct": 31.7, "frames": 5.3, "rounds": 1.74, "time_s": 1.22},
+        "setting_note": (
+            "Requires the original Table 4 baseline checkpoint via REVISE_NEXTQA_TABLE4_BASE_MODEL and "
+            "uses the paper's 1-fps NExT-QA action timeline. Current public Qwen2.5-VL-3B-Instruct "
+            "probes collapse toward early answers and are not paper-comparable for this row."
+        ),
+        "check": _require_nextqa_table4_base_model,
+        "build": _cmd_nextqa_table4_pnp,
+        "run_supported": True,
+    },
+    "nextqa_table4_sft": {
+        "title": "Table 4 NExT-QA supervised format fine-tuning row",
+        "paper_ref": "paper Table 4 / overleaf/tables/RL Results.tex",
+        "paper_metrics": {"acc_pct": 27.3, "frames": 5.1, "rounds": 1.65, "time_s": 1.13},
+        "setting_note": "Use variable-length valid traces; the recovered RFT path uses a 45% first-select SFT prior.",
+        "check": _require_nextqa_sft_checkpoint,
+        "build": _cmd_nextqa_table4_sft_eval,
+        "run_supported": True,
+    },
+    "nextqa_table4_rl_after_sft": {
+        "title": "Table 4 NExT-QA reinforced fine-tuning row",
+        "paper_ref": "paper Table 4 / overleaf/tables/RL Results.tex",
+        "paper_metrics": {"acc_pct": 51.3, "frames": 3.9, "rounds": 1.32, "time_s": 0.62},
+        "setting_note": (
+            "Recovered local setting: full-trajectory GRPO after SFT, 45% first-select SFT prior, "
+            "1-fps NExT-QA action timeline, and stop_bonus_beta=0.0 to avoid one-round collapse."
+        ),
+        "check": _require_nextqa_rl_after_sft_checkpoint,
+        "build": _cmd_nextqa_table4_rl_after_sft,
+        "run_supported": True,
+    },
     "nextqa_pnp": {
         "title": "NExT-QA plug-and-play",
         "paper_ref": "paper tables: NExT-QA, RL Results",
@@ -1386,7 +1830,10 @@ EXPERIMENTS: dict[str, dict[str, object]] = {
         # entries target the same checkpoint dir — accidental double-submit
         # then collides cleanly on the path instead of silently spending
         # another ~4-GPU * 24h training the same model.
-        "title": "LVBench reward ablation row 7: stop design beta=1, tau=2 - alias of row 2 (shared training run; do not submit independently)",
+        "title": (
+            "LVBench reward ablation row 7: stop design beta=1, tau=2 - alias of row 2 "
+            "(shared training run; do not submit independently)"
+        ),
         "paper_ref": "overleaf/tables/abaltion_reward.tex row: beta=1, tau=2",
         "check": _require_lvbench_training_cache,
         "build": _lvbench_reward_ablation_builder(
@@ -1409,10 +1856,8 @@ def _selected_ids(args: argparse.Namespace) -> list[str]:
     return list(args.experiment)
 
 
-def cmd_to_text(cmd: list[str] | str) -> str:
-    if isinstance(cmd, str):
-        return cmd
-    return shlex.join(cmd)
+def _build_report(exp_ids: list[str], assets: dict, smoke: bool, out_dir: Path) -> dict[str, object]:
+    return _build_report_from_catalog(EXPERIMENTS, exp_ids, assets, smoke, out_dir)
 
 
 def main() -> int:
@@ -1431,6 +1876,13 @@ def main() -> int:
     run_ap.add_argument("--smoke", action="store_true", help="Run the smallest supported variant.")
     run_ap.add_argument("--dry-run", action="store_true")
     run_ap.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "paper_suite"))
+
+    report_ap = sub.add_parser("report")
+    report_ap.add_argument("--experiment", action="append")
+    report_ap.add_argument("--all", action="store_true")
+    report_ap.add_argument("--smoke", action="store_true", help="Apply smoke-run data availability rules.")
+    report_ap.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "paper_suite"))
+    report_ap.add_argument("--output-json", default=None)
 
     args = ap.parse_args()
     assets = discover_assets()
@@ -1452,19 +1904,37 @@ def main() -> int:
             print(f"  command: {cmd_to_text(meta['build'](assets, bool(args.smoke), Path('/tmp')))}")
         return 0
 
+    if args.cmd == "report":
+        out_dir = Path(args.output_dir)
+        report = _build_report(_selected_ids(args), assets, bool(args.smoke), out_dir)
+        if args.output_json:
+            output_json = Path(args.output_json)
+            output_json.parent.mkdir(parents=True, exist_ok=True)
+            output_json.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            print("\n".join(_report_summary_lines(report, output_json)))
+        else:
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     for exp_id in _selected_ids(args):
         meta = EXPERIMENTS[exp_id]
         missing = meta["check"](assets, bool(args.smoke))  # type: ignore[index]
+        cmd = meta["build"](assets, bool(args.smoke), out_dir)  # type: ignore[index]
+        if args.dry_run:
+            status = "dry-run blocked" if missing else "dry-run"
+            print(f"[{status}] {exp_id}")
+            if missing:
+                for item in missing:
+                    print(f"  - {item}")
+            print(cmd_to_text(cmd))
+            continue
         if missing:
             print(f"[blocked] {exp_id}: {'; '.join(missing)}")
             return 2
-        cmd = meta["build"](assets, bool(args.smoke), out_dir)  # type: ignore[index]
         print(f"[run] {exp_id}")
         print(cmd_to_text(cmd))
-        if args.dry_run:
-            continue
         if not meta["run_supported"]:
             print(f"[manual] {exp_id} must be run manually.")
             continue

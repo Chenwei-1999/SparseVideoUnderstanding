@@ -17,8 +17,8 @@ custom_reward_function:
     gamma: 0.99
     format_reward: 0.05
     stop_round_threshold: 2
-    # Early-stop shaping: extra bonus within the threshold (β). 0.0 keeps paper-default behavior.
-    stop_bonus_beta: 0.0
+    # Early-stop shaping: extra bonus within the threshold (β).
+    stop_bonus_beta: 1.0
 
 data:
   custom_cls:
@@ -87,6 +87,7 @@ actor_rollout_ref:
       max_retries_per_round: 1
       initial_sampling: uniform
       include_timestamps: True
+      use_1fps_timeline: True
       # EAGER: compute model-score margins and summary-only scores during rollout.
       compute_margins: True
       margin_logprobs_k: 64

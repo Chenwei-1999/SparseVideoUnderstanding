@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-import importlib.metadata
 import csv
+import importlib.metadata
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ASSET_ROOT = Path(os.getenv("REVISE_ASSET_ROOT", REPO_ROOT / "data" / "revise_assets")).expanduser()
+DISCOVERY_PYTHON = os.getenv("REVISE_PYTHON", "").strip() or sys.executable
 
 
 def _first_existing(candidates: list[str | Path]) -> str | None:
@@ -31,7 +32,28 @@ def _env_or_existing(env_name: str, candidates: list[str | Path]) -> str | None:
     return _first_existing(candidates)
 
 
+def _env_value(env_name: str) -> str | None:
+    value = os.getenv(env_name, "").strip()
+    return value or None
+
+
 def _metadata_version(dist_name: str) -> str | None:
+    if str(DISCOVERY_PYTHON) != str(sys.executable):
+        code = (
+            "import importlib.metadata, sys\n"
+            "name = sys.argv[1]\n"
+            "try:\n"
+            "    print(importlib.metadata.version(name))\n"
+            "except importlib.metadata.PackageNotFoundError:\n"
+            "    module_name = name.replace('-', '_')\n"
+            "    try:\n"
+            "        module = __import__(module_name)\n"
+            "    except Exception:\n"
+            "        raise SystemExit(2)\n"
+            "    print(getattr(module, '__version__', 'installed'))\n"
+        )
+        rc, output = _run([str(DISCOVERY_PYTHON), "-c", code, dist_name])
+        return output if rc == 0 and output else None
     try:
         return importlib.metadata.version(dist_name)
     except importlib.metadata.PackageNotFoundError:
@@ -43,6 +65,15 @@ def _metadata_version(dist_name: str) -> str | None:
         return getattr(module, "__version__", "installed")
 
 
+def _python_version() -> str | None:
+    if str(DISCOVERY_PYTHON) != str(sys.executable):
+        rc, output = _run([str(DISCOVERY_PYTHON), "-c", "import sys; print(sys.version.split()[0])"])
+        if rc == 0 and output:
+            return output.splitlines()[-1].strip()
+        return None
+    return sys.version.split()[0]
+
+
 def _run(cmd: list[str]) -> tuple[int, str]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -50,6 +81,12 @@ def _run(cmd: list[str]) -> tuple[int, str]:
         return 1, str(exc)
     output = (proc.stdout or proc.stderr or "").strip()
     return proc.returncode, output
+
+
+def _command_path(name: str) -> str | None:
+    python_bin_dir = str(Path(DISCOVERY_PYTHON).expanduser().parent)
+    candidate = shutil.which(name, path=python_bin_dir + os.pathsep + os.environ.get("PATH", ""))
+    return candidate or None
 
 
 _PROBE_ROW_LIMIT = 32
@@ -73,7 +110,7 @@ def _read_json_array_prefix(path: str, limit: int) -> tuple[list[Any], bool]:
     items: list[Any] = []
     buf = ""
     started = False
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         while len(items) < limit:
             if not started:
                 stripped = buf.lstrip()
@@ -151,9 +188,9 @@ def _probe_nextqa_video(csv_path: str | None, map_json: str | None, video_root: 
     if not csv_path or not map_json or not video_root:
         return out
     try:
-        from revise.pnp_utils import normalize_video_id, resolve_nextqa_video_path
+        from revise.pnp.utils import normalize_video_id, resolve_nextqa_video_path
 
-        with open(map_json, "r", encoding="utf-8") as f:
+        with open(map_json, encoding="utf-8") as f:
             video_map = {str(k): v for k, v in json.load(f).items()}
         checked = 0
         mapped = 0
@@ -272,10 +309,18 @@ def discover_assets() -> dict[str, Any]:
             ASSET_ROOT / "models" / "Qwen2.5-VL-3B-Instruct",
         ],
     )
+    nextqa_table4_base = _env_or_existing("REVISE_NEXTQA_TABLE4_BASE_MODEL", [])
+    nextqa_table4_base_model_id = os.getenv("REVISE_NEXTQA_TABLE4_BASE_MODEL_ID", "").strip() or None
     qwen_7b = _env_or_existing(
         "REVISE_QWEN25_VL_7B_PATH",
         [
             ASSET_ROOT / "models" / "Qwen2.5-VL-7B-Instruct",
+        ],
+    )
+    qwen35_4b = _env_or_existing(
+        "REVISE_QWEN35_4B_PATH",
+        [
+            ASSET_ROOT / "models" / "Qwen3.5-4B",
         ],
     )
     qwen_72b = _env_or_existing(
@@ -298,7 +343,7 @@ def discover_assets() -> dict[str, Any]:
         "REVISE_LLAVA_NEXT_PATH",
         [ASSET_ROOT / "third_party" / "LLaVA-NeXT"],
     )
-    local_model = _env_or_existing("REVISE_LOCAL_MODEL_PATH", [])
+    local_model = _env_value("REVISE_LOCAL_MODEL_PATH")
     local_model_id = os.getenv("REVISE_LOCAL_MODEL_ID", "").strip() or None
 
     gpu_rc, gpu_out = _run(
@@ -308,11 +353,21 @@ def discover_assets() -> dict[str, Any]:
             "--format=csv,noheader",
         ]
     )
+    gpu_count = len([line for line in gpu_out.splitlines() if line.strip()]) if gpu_rc == 0 else 0
+
+    python_version = _python_version()
 
     return {
         "repo_root": str(REPO_ROOT),
         "asset_root": str(ASSET_ROOT),
-        "python": {"path": sys.executable, "version": sys.version.split()[0]},
+        "python": {
+            "path": str(DISCOVERY_PYTHON),
+            "version": python_version or "unavailable",
+            "available": python_version is not None,
+        },
+        "commands": {
+            "vllm": _command_path("vllm"),
+        },
         "packages": {
             "torch": _metadata_version("torch"),
             "transformers": _metadata_version("transformers"),
@@ -326,12 +381,15 @@ def discover_assets() -> dict[str, Any]:
             "wandb": _metadata_version("wandb"),
             "scikit-learn": _metadata_version("scikit-learn"),
         },
-        "gpu": {"available": gpu_rc == 0, "raw": gpu_out},
+        "gpu": {"available": gpu_rc == 0, "count": gpu_count, "raw": gpu_out},
         "models": {
             "local_model": local_model,
             "local_model_id": local_model_id,
+            "nextqa_table4_base": nextqa_table4_base,
+            "nextqa_table4_base_model_id": nextqa_table4_base_model_id,
             "qwen25_vl_3b": qwen_3b,
             "qwen25_vl_7b": qwen_7b,
+            "qwen35_4b": qwen35_4b,
             "qwen25_vl_72b": qwen_72b,
             "qwen2_vl_7b": qwen2_vl_7b,
             "internvl2_8b": internvl2_8b,

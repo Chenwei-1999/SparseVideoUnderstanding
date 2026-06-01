@@ -11,7 +11,6 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 VIDEOESPRESSO_TEST_REPO = "hshjerry0315/VideoEspresso-Test"
@@ -272,7 +271,10 @@ def main() -> int:
                 nextqa_root / "nextqa_test_data.zip",
                 dry_run=True,
             ),
-            "note": "NExT-QA requires accepting/downloading Google Drive assets; clone the official repo for annotations, then set the exports below.",
+            "note": (
+                "NExT-QA requires accepting/downloading Google Drive assets; "
+                "clone the official repo for annotations, then set the exports below."
+            ),
         }
         exports.update(
             {

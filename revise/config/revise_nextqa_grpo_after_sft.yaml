@@ -17,6 +17,8 @@ custom_reward_function:
     gamma: 0.99
     format_reward: 0.05
     stop_round_threshold: 2
+    # Empirical Table 4 setting: the paper-style positive early-stop bonus
+    # collapses the Qwen2.5-VL-3B SFT policy toward one-round answers.
     stop_bonus_beta: 0.0
 
 data:
@@ -30,7 +32,7 @@ data:
   val_files: ${oc.env:REVISE_NEXTQA_VAL_CSV,${hydra:runtime.cwd}/data/revise_assets/NExT-QA/nextqa/val.csv}
   max_prompt_length: 8192
   max_response_length: 4096
-  train_batch_size: 2
+  train_batch_size: 8
   return_raw_chat: True
   return_multi_modal_inputs: False
 
@@ -46,7 +48,7 @@ actor_rollout_ref:
       model_dtype: bfloat16
     optim:
       lr: 1e-6
-    ppo_mini_batch_size: 128
+    ppo_mini_batch_size: ${data.train_batch_size}
     use_dynamic_bsz: True
     use_kl_loss: True
     kl_loss_coef: 0.001
@@ -58,7 +60,7 @@ actor_rollout_ref:
     name: vllm
     prompt_length: ${data.max_prompt_length}
     response_length: ${data.max_response_length}
-    max_new_tokens: 128
+    max_new_tokens: 256
     temperature: 0.2
     top_p: 0.9
     do_sample: True
@@ -83,8 +85,12 @@ actor_rollout_ref:
       max_frames_per_round: 3
       max_vision_inputs: 5
       max_retries_per_round: 1
+      # Keep Table 4 early stopping comparable. Use a positive value only for
+      # explicit anti-collapse ablations, not for the default paper setting.
+      min_select_rounds: 0
       initial_sampling: uniform
       include_timestamps: True
+      use_1fps_timeline: True
       compute_margins: True
       margin_logprobs_k: 64
       margin_temperature: 1.0
@@ -102,7 +108,7 @@ trainer:
   n_gpus_per_node: 4
   resume_mode: disable
   val_before_train: False
-  test_freq: -1
+  test_freq: 100
   save_freq: 100
   max_actor_ckpt_to_keep: 1
   logger: ["console", "wandb"]
@@ -110,4 +116,5 @@ trainer:
 
 ray_kwargs:
   ray_init:
+    address: local
     num_cpus: 32

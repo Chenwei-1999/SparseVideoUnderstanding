@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-
 EXPERIMENTS = {
     "nextqa_train_pipeline": {
         "teacher_stems": ("nextqa_teacher_smoke", "nextqa_teacher"),
@@ -28,7 +27,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if not path.exists():
         return rows
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -68,11 +67,11 @@ def _extract_json_objects(text: str) -> list[dict[str, Any]]:
     return out
 
 
-def _teacher_summary_from_stdout(slurm_dir: Path, job_id: str | None, experiment: str) -> dict[str, Any] | None:
+def _teacher_summary_from_stdout(log_dir: Path, job_id: str | None, experiment: str) -> dict[str, Any] | None:
     candidates: list[Path] = []
     if job_id:
-        candidates.extend(sorted(slurm_dir.glob(f"*{job_id}.out")))
-    candidates.extend(sorted(slurm_dir.glob(f"*{experiment}*.out")))
+        candidates.extend(sorted(log_dir.glob(f"*{job_id}.out")))
+    candidates.extend(sorted(log_dir.glob(f"*{experiment}*.out")))
     for path in candidates:
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -104,7 +103,11 @@ def _summarize(run_dir: Path, experiment: str, job_id: str | None) -> dict[str, 
 
     teacher_rows = _read_jsonl(teacher_log) if teacher_log else []
     sample_ids = {str(row.get("sample_id")) for row in teacher_rows if row.get("sample_id") is not None}
-    teacher_summary = _teacher_summary_from_stdout(run_dir / "slurm", job_id, experiment) or {}
+    teacher_summary = (
+        _teacher_summary_from_stdout(run_dir / "logs", job_id, experiment)
+        or _teacher_summary_from_stdout(run_dir / "slurm", job_id, experiment)
+        or {}
+    )
     samples = int(teacher_summary.get("samples") or len(sample_ids))
     calls = int(teacher_summary.get("total_model_calls") or len(teacher_rows))
     failed = int(teacher_summary.get("failed") or 0)

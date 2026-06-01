@@ -14,11 +14,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from revise.plug_and_play_videomme_lvbench_vllm import (  # noqa: E402
-    _download_youtube,
-    _load_lvbench_samples,
-    _load_videomme_samples,
-)
+from revise.datasets.lvbench import load_samples as load_lvbench_samples  # noqa: E402
+from revise.datasets.video_download import download_youtube  # noqa: E402
+from revise.datasets.videomme import load_samples as load_videomme_samples  # noqa: E402
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -49,7 +47,7 @@ def main() -> int:
     os.environ.setdefault("HF_XET_CACHE", str(asset_root / ".hf_home" / "xet"))
 
     split = args.split or ("test" if args.dataset == "videomme" else "train")
-    samples = _load_videomme_samples(split) if args.dataset == "videomme" else _load_lvbench_samples(split)
+    samples = load_videomme_samples(split) if args.dataset == "videomme" else load_lvbench_samples(split)
 
     by_key: dict[str, Any] = {}
     for sample in samples:
@@ -82,7 +80,7 @@ def main() -> int:
             results.append(record)
             continue
         try:
-            _download_youtube(
+            download_youtube(
                 sample.video_url,
                 str(out_path),
                 py_bin=sys.executable,
@@ -108,9 +106,22 @@ def main() -> int:
         "elapsed_s": time.time() - started,
         "results": results,
     }
-    manifest = Path(args.manifest).expanduser() if args.manifest else cache_dir / f"{args.dataset}_{split}_cache_manifest.json"
+    manifest = (
+        Path(args.manifest).expanduser()
+        if args.manifest
+        else cache_dir / f"{args.dataset}_{split}_cache_manifest.json"
+    )
     _write_json(manifest, report)
-    print(json.dumps({"manifest": str(manifest), **{k: report[k] for k in ("selected_videos", "downloaded", "exists", "failed", "dry_run")}}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "manifest": str(manifest),
+                **{k: report[k] for k in ("selected_videos", "downloaded", "exists", "failed", "dry_run")},
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0 if report["failed"] == 0 else 2
 
 

@@ -44,7 +44,7 @@ def _pick_distractors(
     global_pool: list[str],
     k: int,
 ) -> list[str]:
-    seed = int(hashlib.sha1(f"{row_idx}:{correct}".encode("utf-8")).hexdigest(), 16) % (2**32)
+    seed = int(hashlib.sha1(f"{row_idx}:{correct}".encode()).hexdigest(), 16) % (2**32)
     rng = random.Random(seed)
     seen = {correct.lower()}
     chosen: list[str] = []
@@ -143,7 +143,7 @@ def main() -> int:
         if len(distractors) < num_distractors:
             continue
         options = [row["answer"], *distractors[:num_distractors]]
-        seed = int(hashlib.sha1(f"shuffle:{idx}:{row['question']}".encode("utf-8")).hexdigest(), 16) % (2**32)
+        seed = int(hashlib.sha1(f"shuffle:{idx}:{row['question']}".encode()).hexdigest(), 16) % (2**32)
         rng = random.Random(seed)
         rng.shuffle(options)
         answer_idx = options.index(row["answer"])

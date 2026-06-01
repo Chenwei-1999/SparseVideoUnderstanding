@@ -44,7 +44,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ASSET_ROOT = Path(
     os.environ.get(
@@ -142,7 +141,7 @@ def _write_manifest(
 ) -> None:
     """Read-merge-write with an fcntl exclusive lock + per-PID temp file.
 
-    Concurrent Slurm jobs share `bootstrap_manifest.json`. To preserve every
+    Concurrent launcher processes share `bootstrap_manifest.json`. To preserve every
     successful step, we (a) take an exclusive flock on a sibling `.lock` file
     so peers serialize on the write, (b) re-read on-disk inside the lock, and
     (c) merge only the step entry the caller just produced (`just_wrote`) over
@@ -216,7 +215,11 @@ def _runner(name: str, manifest: dict[str, Any], asset_root: Path) -> Callable[[
         # newer entries for other steps are never clobbered.
         _write_manifest(asset_root, manifest, just_wrote=name)
         marker = {"ok": "✓", "skipped": "·", "failed": "✗"}.get(result.status, "?")
-        print(f"[bootstrap_assets] {marker} {name}: {result.status} ({result.elapsed_s:.1f}s) {result.details}", flush=True)
+        print(
+            f"[bootstrap_assets] {marker} {name}: {result.status} "
+            f"({result.elapsed_s:.1f}s) {result.details}",
+            flush=True,
+        )
         return result
 
     return wrap
@@ -262,6 +265,7 @@ def step_models(asset_root: Path, *, models: list[str], dry_run: bool) -> StepRe
         "qwen25_vl_3b": "Qwen2.5-VL-3B-Instruct",
         "qwen25_vl_7b": "Qwen2.5-VL-7B-Instruct",
         "qwen25_vl_72b": "Qwen2.5-VL-72B-Instruct",
+        "qwen35_4b": "Qwen3.5-4B",
         "qwen2_vl_7b": "Qwen2-VL-7B-Instruct",
         "internvl2_8b": "InternVL2-8B",
         "llava_ov_7b": "LLaVA-OneVision-Qwen2-7B-OV",
@@ -301,7 +305,7 @@ def step_models(asset_root: Path, *, models: list[str], dry_run: bool) -> StepRe
     env["HF_HUB_CACHE"] = str(asset_root / "hf_home" / "hub")
     cmd = [
         sys.executable,
-        str(REPO_ROOT / "scripts" / "repro" / "download_hf_models.py"),
+        str(REPO_ROOT / "scripts" / "download_hf_models.py"),
         "--asset-root",
         str(asset_root),
     ]
@@ -762,6 +766,7 @@ def step_env(asset_root: Path) -> StepResult:
         "qwen25_vl_3b": ("Qwen2.5-VL-3B-Instruct", "REVISE_QWEN25_VL_3B_PATH"),
         "qwen25_vl_7b": ("Qwen2.5-VL-7B-Instruct", "REVISE_QWEN25_VL_7B_PATH"),
         "qwen25_vl_72b": ("Qwen2.5-VL-72B-Instruct", "REVISE_QWEN25_VL_72B_PATH"),
+        "qwen35_4b": ("Qwen3.5-4B", "REVISE_QWEN35_4B_PATH"),
         "qwen2_vl_7b": ("Qwen2-VL-7B-Instruct", "REVISE_QWEN2_VL_7B_PATH"),
         "internvl2_8b": ("InternVL2-8B", "REVISE_INTERNVL2_8B_PATH"),
         "llava_ov_7b": ("LLaVA-OneVision-Qwen2-7B-OV", "REVISE_LLAVA_OV_7B_PATH"),
@@ -808,7 +813,10 @@ ALL_STEP_NAMES = [
 def cmd_plan(asset_root: Path, *, models: list[str]) -> int:
     print(f"# Bootstrap plan for {asset_root}\n")
     print(f"Asset root exists: {asset_root.exists()}")
-    print(f"Existing VE test (1364 mp4 expected): {_count_mp4(EXISTING_VIDEOESPRESSO_TEST / 'all_video')} mp4 at {EXISTING_VIDEOESPRESSO_TEST}")
+    print(
+        "Existing VE test (1364 mp4 expected): "
+        f"{_count_mp4(EXISTING_VIDEOESPRESSO_TEST / 'all_video')} mp4 at {EXISTING_VIDEOESPRESSO_TEST}"
+    )
     print(f"Existing VE train dir: {EXISTING_VIDEOESPRESSO_TRAIN.exists()}")
     print(f"Existing NExT-QA videos: {_count_mp4(EXISTING_NEXTQA_VIDEO)} mp4 at {EXISTING_NEXTQA_VIDEO}")
     print(f"\nSteps that will run (in order): {', '.join(ALL_STEP_NAMES)}")
@@ -873,7 +881,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--model",
         action="append",
         default=[],
-        help="Repeatable. HF model key (qwen25_vl_3b, qwen25_vl_7b, qwen25_vl_72b, qwen2_vl_7b, internvl2_8b, llava_ov_7b). Defaults to all paper models.",
+        help=(
+            "Repeatable. HF model key (qwen25_vl_3b, qwen25_vl_7b, qwen25_vl_72b, "
+            "qwen35_4b, qwen2_vl_7b, internvl2_8b, llava_ov_7b). Defaults to all paper models."
+        ),
     )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)

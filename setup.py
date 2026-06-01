@@ -94,6 +94,7 @@ setup(
     package_data={
         "": ["version/*"],
         "verl": ["trainer/config/*.yaml"],
+        "revise": ["config/*.yaml"],
     },
     include_package_data=True,
     long_description=long_description,

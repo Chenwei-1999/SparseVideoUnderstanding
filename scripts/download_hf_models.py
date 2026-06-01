@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -43,6 +42,13 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         local_name="Qwen2.5-VL-72B-Instruct",
         env_var="REVISE_QWEN25_VL_72B_PATH",
         paper_rows=("SFT teacher (72B distillation, GPT-4o substitute)",),
+    ),
+    "qwen35_4b": ModelSpec(
+        key="qwen35_4b",
+        repo_id="Qwen/Qwen3.5-4B",
+        local_name="Qwen3.5-4B",
+        env_var="REVISE_QWEN35_4B_PATH",
+        paper_rows=("experimental NExT-QA ablation; not Table 4 comparable",),
     ),
     "qwen2_vl_7b": ModelSpec(
         key="qwen2_vl_7b",
@@ -157,7 +163,11 @@ def _snapshot_download(spec: ModelSpec, local_dir: Path, *, dry_run: bool) -> di
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download exact HF model snapshots used by REVISE paper rows.")
     parser.add_argument("--model", action="append", choices=sorted(MODEL_SPECS))
-    parser.add_argument("--paper-models", action="store_true", help="Download Qwen2-VL-7B, InternVL2-8B, and LLaVA-OV-7B.")
+    parser.add_argument(
+        "--paper-models",
+        action="store_true",
+        help="Download Qwen2-VL-7B, InternVL2-8B, and LLaVA-OV-7B.",
+    )
     parser.add_argument("--all", action="store_true", help="Download every known local model snapshot.")
     parser.add_argument(
         "--asset-root",
