@@ -46,6 +46,13 @@ The agent starts with 3 uniformly sampled frames, updates its POHR summary, iden
 
 ## Reported Results Under Reproduction Audit
 
+> **Reproducibility note.** We were recently notified by email of a potential issue with our
+> previously reported **VideoEspresso** results, which we are currently investigating. We anticipate
+> a corrected evaluation by **July 2026**; the updated results table will be released afterward. For
+> any questions about reproducing our results, please
+> [open an issue](https://github.com/Chenwei-1999/SparseVideoUnderstanding/issues) or email
+> [cxu@u.northwestern.edu](mailto:cxu@u.northwestern.edu).
+
 The numbers below are the originally reported paper numbers. They are kept for traceability while
 the full reproduction suite is rerun with the corrected evaluation pipelines. Do not treat them as
 newly verified results until the full reproduction suite has completed and the paper tables
