@@ -1,21 +1,23 @@
 import json
+import sys
 import zipfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import examples.revise.plug_and_play_nextqa_vllm as nextqa_vllm
-import examples.revise.plug_and_play_egoschema_vllm as egoschema_vllm
-from examples.revise.plug_and_play_egoschema_vllm import _load_egoschema_samples
-import examples.revise.plug_and_play_lvbench_hf as lvbench_hf
-from examples.revise.plug_and_play_nextqa_vllm import _load_nextqa_samples
-from examples.revise.plug_and_play_videomme_lvbench_vllm import _bare_answer_after_summary
-from examples.revise.pnp_utils import (
+import revise.plug_and_play_nextqa_vllm as nextqa_vllm
+import revise.plug_and_play_egoschema_vllm as egoschema_vllm
+import revise.pnp_utils as pnp_utils
+from revise.plug_and_play_egoschema_vllm import _load_egoschema_samples
+import revise.plug_and_play_lvbench_hf as lvbench_hf
+from revise.plug_and_play_nextqa_vllm import _load_nextqa_samples
+from revise.plug_and_play_videomme_lvbench_vllm import _bare_answer_after_summary
+from revise.pnp_utils import (
     apply_processor_chat_template,
     configure_llava_processor,
     format_videoespresso_question_block,
     format_videomme_question_block,
 )
-from scripts.repro.extract_videoespresso_split_zip_subset import (
+from scripts.extract_videoespresso_split_zip_subset import (
     DEFAULT_PREFIX,
     _extract_entry,
     _part_paths,
@@ -208,6 +210,95 @@ def test_llava_qwen_hf_loader_routes_to_llava_next_runtime(tmp_path):
     assert processor is None
     runtime_mock.assert_called_once()
     auto_mock.assert_not_called()
+
+
+def test_cached_video_reader_reuses_decord_for_metadata_and_frames(monkeypatch):
+    import numpy as np
+
+    constructed = []
+
+    class DummyBatch:
+        def __init__(self, frames):
+            self.frames = frames
+
+        def asnumpy(self):
+            return np.stack(self.frames, axis=0)
+
+    class DummyVideoReader:
+        def __init__(self, path, ctx=None):
+            self.path = path
+            constructed.append(self)
+            self.frames = [
+                np.full((2, 2, 3), fill_value=i, dtype=np.uint8)
+                for i in range(5)
+            ]
+
+        def __len__(self):
+            return len(self.frames)
+
+        def get_avg_fps(self):
+            return 2.0
+
+        def get_batch(self, indices):
+            return DummyBatch([self.frames[i] for i in indices])
+
+    monkeypatch.setitem(
+        sys.modules,
+        "decord",
+        SimpleNamespace(VideoReader=DummyVideoReader, cpu=lambda _idx: "cpu"),
+    )
+
+    reader = pnp_utils.CachedVideoReader("clip.mp4")
+
+    assert reader.info() == (5, 2.0)
+    images = reader.extract_frames([1, 3])
+    assert reader.extract_frames_1fps([0, 2])[1].getpixel((0, 0)) == (4, 4, 4)
+    assert len(images) == 2
+    assert images[0].getpixel((0, 0)) == (1, 1, 1)
+    assert len(constructed) == 1
+
+
+def test_cached_video_reader_maps_timeline_indices_with_cached_metadata(monkeypatch):
+    import numpy as np
+
+    batches = []
+
+    class DummyBatch:
+        def __init__(self, frames):
+            self.frames = frames
+
+        def asnumpy(self):
+            return np.stack(self.frames, axis=0)
+
+    class DummyVideoReader:
+        def __init__(self, path, ctx=None):
+            self.frames = [
+                np.full((1, 1, 3), fill_value=i, dtype=np.uint8)
+                for i in range(10)
+            ]
+
+        def __len__(self):
+            return len(self.frames)
+
+        def get_avg_fps(self):
+            return 3.0
+
+        def get_batch(self, indices):
+            batches.append(list(indices))
+            return DummyBatch([self.frames[i] for i in indices])
+
+    monkeypatch.setitem(
+        sys.modules,
+        "decord",
+        SimpleNamespace(VideoReader=DummyVideoReader, cpu=lambda _idx: "cpu"),
+    )
+
+    reader = pnp_utils.CachedVideoReader("clip.mp4")
+
+    images = reader.extract_frames_1fps([0, 1, 9])
+
+    assert batches == [[0, 3, 9]]
+    assert [img.getpixel((0, 0))[0] for img in images] == [0, 3, 9]
 
 
 def test_vllm_launcher_sets_served_model_name_when_model_id_is_explicit():

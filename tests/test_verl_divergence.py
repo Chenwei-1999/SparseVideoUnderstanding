@@ -1,4 +1,4 @@
-"""Direct regression tests for scripts/repro/verl_divergence.py.
+"""Direct regression tests for scripts/verl_divergence.py.
 
 These tests build a tiny two-tree fixture and verify the classifier
 correctly labels each path as 'modified', 'added_by_revise', or
@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = REPO_ROOT / "scripts" / "repro" / "verl_divergence.py"
+SCRIPT = REPO_ROOT / "scripts" / "verl_divergence.py"
 
 
 def _write(path: Path, content: str) -> None:

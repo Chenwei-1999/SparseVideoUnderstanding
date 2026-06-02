@@ -1,6 +1,6 @@
 import json
 
-from scripts.repro.collect_run_summaries import _collect_experiment
+from scripts.collect_run_summaries import _collect_experiment
 
 
 def test_collector_rejects_missing_model_call_log_rows(tmp_path):
