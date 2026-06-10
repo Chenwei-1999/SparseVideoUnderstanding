@@ -16,8 +16,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-import revise.plug_and_play_egoschema_vllm as egoschema
-
+import revise.benchmarks.egoschema_vllm as egoschema
 
 SELECT_ROUND = (
     "<think>reasoning</think>\n"

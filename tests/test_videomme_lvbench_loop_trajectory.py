@@ -16,8 +16,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-import revise.plug_and_play_videomme_lvbench_vllm as videomme_lvbench
-
+import revise.benchmarks.videomme_lvbench_vllm as videomme_lvbench
 
 SELECT_ROUND = (
     "<think>need more evidence</think>\n"
@@ -152,29 +151,37 @@ def _run_loop(dataset_name, scripted_outputs, *, sample_count=None):
 
 
 class VideoMMeLvbenchLoopTrajectoryTest(unittest.TestCase):
+    # Re-baselined to the consolidated shared-engine runner: the strict paper
+    # protocol (<think> + <summarize>/<select> or <answer>, no extra text)
+    # rejects bare answers as actions ("invalid_paper_protocol"), while still
+    # logging the recoverable letter on the record for analysis. The lenient
+    # bare-answer acceptance these goldens originally froze belonged to the
+    # deleted standalone launcher.
     def test_videomme_select_answer_then_invalid_bare_answer_golden(self):
         rc, results, records = _run_loop("videomme", [SELECT_ROUND, ANSWER_A, NO_TAGS, BARE_ANSWER_B])
         self.assertEqual(rc, 0)
         self.assertEqual(results, {
             "samples": 2,
             "answered": 2,
-            "correct": 2,
-            "accuracy": 1.0,
-            "avg_rounds": 2.0,
+            "correct": 1,
+            "accuracy": 0.5,
+            "avg_rounds": 2.5,
             "avg_effective_rounds": 0.5,
-            "avg_frames_used": 3.0,
-            "avg_frames_used_all": 3.0,
+            "avg_frames_used": 5.0,
+            "avg_frames_used_all": 5.0,
             "failed": 0,
-            "prompt_log_lines": 4,
-            "invalid_outputs": 1,
+            "prompt_log_lines": 5,
+            "invalid_outputs": 2,
             "invalid_action_terminated": 0,
-            "total_retries": 1,
-            "total_model_calls": 4,
-            "think_present_rounds": 2,
-            "missing_summary_rounds": 2,
+            "total_retries": 0,
+            "total_model_calls": 5,
+            "think_present_rounds": 3,
+            "missing_summary_rounds": 0,
         })
         self.assertEqual(records[1]["answer_letter"], "A")
+        # Bare "B" is logged on the rejected round but not accepted as the action.
         self.assertEqual(records[3]["answer_letter"], "B")
+        self.assertEqual(records[4]["answer_letter"], "A")
 
     def test_lvbench_time_window_select_answer_then_invalid_bare_answer_golden(self):
         rc, results, records = _run_loop("lvbench", [SELECT_ROUND, ANSWER_A, NO_TAGS, BARE_ANSWER_B])
@@ -182,23 +189,24 @@ class VideoMMeLvbenchLoopTrajectoryTest(unittest.TestCase):
         self.assertEqual(results, {
             "samples": 2,
             "answered": 2,
-            "correct": 2,
-            "accuracy": 1.0,
-            "avg_rounds": 2.0,
+            "correct": 1,
+            "accuracy": 0.5,
+            "avg_rounds": 2.5,
             "avg_effective_rounds": 0.5,
-            "avg_frames_used": 3.0,
-            "avg_frames_used_all": 3.0,
+            "avg_frames_used": 5.0,
+            "avg_frames_used_all": 5.0,
             "failed": 0,
-            "prompt_log_lines": 4,
-            "invalid_outputs": 1,
+            "prompt_log_lines": 5,
+            "invalid_outputs": 2,
             "invalid_action_terminated": 0,
-            "total_retries": 1,
-            "total_model_calls": 4,
-            "think_present_rounds": 2,
-            "missing_summary_rounds": 2,
+            "total_retries": 0,
+            "total_model_calls": 5,
+            "think_present_rounds": 3,
+            "missing_summary_rounds": 0,
         })
         self.assertEqual(records[1]["answer_letter"], "A")
         self.assertEqual(records[3]["answer_letter"], "B")
+        self.assertEqual(records[4]["answer_letter"], "A")
 
     def test_invalid_candidate_ids_fall_back_to_candidate_frames_golden(self):
         rc, results, records = _run_loop(
@@ -223,7 +231,7 @@ class VideoMMeLvbenchLoopTrajectoryTest(unittest.TestCase):
             "total_retries": 0,
             "total_model_calls": 2,
             "think_present_rounds": 2,
-            "missing_summary_rounds": 1,
+            "missing_summary_rounds": 0,
         })
         self.assertEqual(records[1]["answer_letter"], "A")
         self.assertEqual(len(records[1]["seen_frames"]), 4)

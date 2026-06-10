@@ -30,11 +30,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import revise.pnp_utils as pnp_utils
-import revise.plug_and_play_nextqa_vllm as nextqa
-import revise.plug_and_play_egoschema_vllm as egoschema
-import revise.plug_and_play_videomme_lvbench_vllm as videomme
-import revise.plug_and_play_lvbench_hf as lvbench_hf
+import revise.benchmarks.egoschema_vllm as egoschema
+import revise.benchmarks.nextqa_vllm as nextqa
+import revise.benchmarks.videomme_lvbench_vllm as videomme
+import revise.datasets.lvbench as lvbench_hf
+import revise.pnp.utils as pnp_utils
 
 
 class SampleUnseenFramesTest(unittest.TestCase):
@@ -79,11 +79,14 @@ class RetryFeedbackTextTest(unittest.TestCase):
             self.assertEqual(mod._retry_feedback_text("fb", force_answer=False), self.NON_FORCE)
 
     def test_nextqa_force_text_golden(self):
+        # Re-baselined after the runtime consolidation: the force-answer round
+        # now forbids <summarize> (the paper's Answer round is <think>+<answer>
+        # only), instead of describing the P/O/H/U/R summary format.
         self.assertEqual(
             nextqa._retry_feedback_text("fb", force_answer=True),
             "fb\n"
             "Output ONLY <think>...</think> then <answer>LETTER</answer>. "
-            "In <summarize>, include P/O/H/U/R in that exact order. "
+            "Do NOT include <summarize> on the answer round. "
             "In <answer>, LETTER must be a single option letter (e.g., A/B/C/D/E).",
         )
 
@@ -174,13 +177,12 @@ class OpenServerLogStreamsTest(unittest.TestCase):
             self.assertTrue(os.path.exists(log_path))
 
 
-class LoaderDivergenceTest(unittest.TestCase):
-    """Document (and guard) why the videomme/lvbench loaders are NOT merged.
+class VideoMMELoaderTest(unittest.TestCase):
+    """Pin the unified Video-MME loader behavior.
 
-    The same-named ``_load_videomme_samples`` differs between the two scripts:
-    the vLLM variant keeps every row and records a ``video_url``; the HF variant
-    drops rows with an empty answer and carries ``question_type``/``video_type``
-    instead. Unifying them would change which samples each pipeline scores.
+    The runtime consolidation unified the per-launcher loaders onto this single
+    implementation: every row is kept (empty-answer rows score as wrong rather
+    than being silently dropped) and the source ``video_url`` is recorded.
     """
 
     ROWS = [
@@ -190,20 +192,12 @@ class LoaderDivergenceTest(unittest.TestCase):
          "question": "Q2?", "options": ["A. a", "B. b"], "answer": "", "domain": "d", "duration": "long"},
     ]
 
-    def test_vllm_loader_keeps_all_rows_and_records_url(self):
+    def test_loader_keeps_all_rows_and_records_url(self):
         with patch.object(videomme, "load_dataset", return_value=list(self.ROWS)):
             samples = videomme._load_videomme_samples("test")
         self.assertEqual(len(samples), 2)  # empty-answer row retained
         self.assertEqual(samples[0].video_url, "http://x/1")
         self.assertTrue(hasattr(samples[0], "video_url"))
-
-    def test_hf_loader_drops_empty_answer_and_has_no_url(self):
-        with patch.object(lvbench_hf, "load_dataset", return_value=list(self.ROWS)):
-            samples = lvbench_hf._load_videomme_samples("test")
-        self.assertEqual(len(samples), 1)  # empty-answer row filtered out
-        self.assertFalse(hasattr(samples[0], "video_url"))
-        self.assertEqual(samples[0].question_type, "d")
-        self.assertEqual(samples[0].video_type, "short")
 
 
 if __name__ == "__main__":

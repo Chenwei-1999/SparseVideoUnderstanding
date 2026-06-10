@@ -24,7 +24,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import revise.plug_and_play_nextqa_vllm as nextqa
+import revise.backends.vllm_http as vllm_http
+import revise.benchmarks.nextqa_vllm as nextqa
+import revise.datasets.nextqa as nextqa_dataset
+import revise.pnp_cli as pnp_cli
 
 # A valid Select round: <think> + a P/O/H/U/R <summarize> + a <select> request.
 SELECT_ROUND = (
@@ -41,6 +44,12 @@ NO_TAGS = "no tags here"
 _VOLATILE = ("elapsed_s", "prompt_log_bytes")
 
 
+def _fake_frames(_video_path, indices, *args, **kwargs):
+    from PIL import Image
+
+    return [Image.new("RGB", (2, 2)) for _ in indices]
+
+
 def _two_samples():
     return [
         nextqa.NextQASample("s1", "q1", "v1", "v1.mp4", "What?",
@@ -54,7 +63,7 @@ def _run_loop(scripted_outputs, extra_argv=None):
     """Drive nextqa.main() end-to-end with a mocked transport; return results dict."""
     outputs = iter(scripted_outputs)
 
-    def fake_chat_once(**_kwargs):
+    def fake_chat_once(*_args, **_kwargs):
         try:
             return next(outputs)
         except StopIteration:  # safety: should not be reached by these scenarios
@@ -72,13 +81,19 @@ def _run_loop(scripted_outputs, extra_argv=None):
         ]
         if extra_argv:
             argv += extra_argv
+        # The loop now runs through the shared engine (revise.pnp_cli + engine),
+        # so the seams live in the dataset adapter and the vLLM HTTP backend
+        # rather than on the (compatibility) launcher module itself.
         with patch.object(sys, "argv", argv), \
-                patch.object(nextqa, "_load_nextqa_samples", return_value=_two_samples()), \
-                patch.object(nextqa, "get_model_id", return_value="test-model"), \
-                patch.object(nextqa, "maybe_init_wandb", return_value=None), \
-                patch.object(nextqa, "wandb_log", return_value=None), \
-                patch.object(nextqa, "extract_frames", return_value=[]), \
-                patch.object(nextqa, "_chat_once", side_effect=fake_chat_once):
+                patch.object(nextqa_dataset, "load_samples", return_value=_two_samples()), \
+                patch.object(pnp_cli, "get_model_id", return_value="test-model"), \
+                patch.object(vllm_http, "get_model_id", return_value="test-model"), \
+                patch.object(pnp_cli, "maybe_init_wandb", return_value=None), \
+                patch.object(pnp_cli, "wandb_log", return_value=None), \
+                patch.object(nextqa_dataset, "extract_frames_1fps", side_effect=_fake_frames), \
+                patch.object(nextqa_dataset, "extract_video_info", return_value=(10, 1.0)), \
+                patch.object(nextqa_dataset, "_get_video_fps", return_value=1.0), \
+                patch.object(vllm_http, "chat_once", side_effect=fake_chat_once):
             rc = nextqa.main()
         results = json.load(open(summary_path, encoding="utf-8"))["results"]
     for k in _VOLATILE:

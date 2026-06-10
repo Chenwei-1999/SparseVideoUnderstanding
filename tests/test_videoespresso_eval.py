@@ -4,14 +4,14 @@ import zipfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import revise.plug_and_play_nextqa_vllm as nextqa_vllm
-import revise.plug_and_play_egoschema_vllm as egoschema_vllm
-import revise.pnp_utils as pnp_utils
-from revise.plug_and_play_egoschema_vllm import _load_egoschema_samples
-import revise.plug_and_play_lvbench_hf as lvbench_hf
-from revise.plug_and_play_nextqa_vllm import _load_nextqa_samples
-from revise.plug_and_play_videomme_lvbench_vllm import _bare_answer_after_summary
-from revise.pnp_utils import (
+import revise.backends.hf_inprocess as hf_inprocess
+import revise.benchmarks.egoschema_vllm as egoschema_vllm
+import revise.benchmarks.nextqa_vllm as nextqa_vllm
+import revise.pnp.utils as pnp_utils
+from revise.benchmarks.egoschema_vllm import _load_egoschema_samples
+from revise.benchmarks.nextqa_vllm import _load_nextqa_samples
+from revise.benchmarks.videomme_lvbench_vllm import _bare_answer_after_summary
+from revise.pnp.utils import (
     apply_processor_chat_template,
     configure_llava_processor,
     format_videoespresso_question_block,
@@ -202,14 +202,14 @@ def test_llava_qwen_hf_loader_routes_to_llava_next_runtime(tmp_path):
     )
     runtime = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=32768))
 
-    with patch.object(lvbench_hf, "load_llava_next_runtime", return_value=runtime) as runtime_mock:
-        with patch.object(lvbench_hf.AutoModelForVision2Seq, "from_pretrained") as auto_mock:
-            model, processor = lvbench_hf._load_model_and_processor(str(model_dir), "bfloat16", "cuda:0")
+    with patch.object(hf_inprocess, "load_llava_next_runtime", return_value=runtime) as runtime_mock:
+        with patch.object(hf_inprocess, "_load_transformers_components") as components_mock:
+            model, processor = hf_inprocess._load_model_and_processor(str(model_dir), "bfloat16", "cuda:0")
 
     assert model is runtime
     assert processor is None
     runtime_mock.assert_called_once()
-    auto_mock.assert_not_called()
+    components_mock.assert_not_called()
 
 
 def test_cached_video_reader_reuses_decord_for_metadata_and_frames(monkeypatch):
