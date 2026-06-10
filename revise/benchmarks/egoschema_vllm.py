@@ -907,8 +907,9 @@ def main() -> int:
     )
     parser.add_argument("--num-shards", type=int, default=1, help="Shard the dataset for data-parallel evaluation.")
     parser.add_argument("--shard-idx", type=int, default=0, help="Shard index in [0, num_shards).")
-    parser.add_argument("--max-rounds", type=int, default=5)
-    parser.add_argument("--max-frames-per-round", "--max-frames", type=int, default=5)
+    # Paper setting (Sec. 4 "Settings"): max_rounds=4 (T=4), max_frames_per_round=3.
+    parser.add_argument("--max-rounds", type=int, default=4)
+    parser.add_argument("--max-frames-per-round", "--max-frames", type=int, default=3)
     parser.add_argument(
         "--use-candidate-frames",
         action="store_true",

@@ -15,7 +15,6 @@
 /presentations/
 /experiments/
 /literature/
-# /docs/superpowers/specs/ is tracked (design specs); ephemeral superpowers state lives under /.superpowers/
 /.agents/
 /.claude/
 /.codex/
@@ -29,7 +28,6 @@ task_plan.md
 notes.md
 deliverable.md
 /plans/
-1
 
 # Runtime outputs and experiment artifacts
 /outputs/
@@ -62,8 +60,6 @@ deliverable.md
 *.ytdl
 *.pptx
 *,cover
-output.txt
-=0.5.5
 
 # Datasets, media caches, and downloaded assets
 /data
@@ -74,9 +70,6 @@ output.txt
 /playground/
 /video_cache/
 /hf_cache/
-tensorflow/my_graph/
-nextqa_allcaps_1fps.zip
-data/nextqa_allcaps_1fps/
 *.mp4
 *.avi
 *.mov
@@ -168,5 +161,11 @@ target/
 local_settings.py
 instance/
 celerybeat-schedule
-.env
 .claude_resources.json
+
+# Credentials — never publish
+.env
+.env.*
+*.pem
+*.key
+credentials.json

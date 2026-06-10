@@ -250,7 +250,7 @@ def main() -> int:
         required=True,
         help="Glob for prompts.jsonl files (e.g., '/path/to/run/shard_*/prompts.jsonl')",
     )
-    ap.add_argument("--max-rounds", type=int, default=5, help="Round budget used in the run.")
+    ap.add_argument("--max-rounds", type=int, default=4, help="Round budget used in the run.")
     args = ap.parse_args()
 
     paths = sorted(glob.glob(args.log_glob))

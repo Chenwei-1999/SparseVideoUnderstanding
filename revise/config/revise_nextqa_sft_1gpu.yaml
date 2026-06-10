@@ -19,7 +19,7 @@ data:
   balance_dp_token: true
 
 model:
-  partial_pretrain: /gpfs/projects/p32027/hf_cache/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3
+  partial_pretrain: ${oc.env:REVISE_QWEN25_VL_3B_PATH,${hydra:runtime.cwd}/data/revise_assets/models/Qwen2.5-VL-3B-Instruct}
   fsdp_config:
     model_dtype: bfloat16
     wrap_policy:

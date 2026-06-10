@@ -1918,6 +1918,16 @@ def main() -> int:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # collect_run_summaries.py and build_verified_result_tables.py read this
+    # manifest, so every non-dry run must leave one behind even on failure.
+    experiments: list[dict[str, object]] = []
+
+    def _write_manifest() -> None:
+        manifest = {"results_dir": str(out_dir), "experiments": experiments}
+        (out_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
     for exp_id in _selected_ids(args):
         meta = EXPERIMENTS[exp_id]
         missing = meta["check"](assets, bool(args.smoke))  # type: ignore[index]
@@ -1930,8 +1940,17 @@ def main() -> int:
                     print(f"  - {item}")
             print(cmd_to_text(cmd))
             continue
+        experiments.append(
+            {
+                "id": exp_id,
+                "command": cmd_to_text(cmd),
+                "blocked": bool(missing),
+                "blocked_reasons": list(missing),
+            }
+        )
         if missing:
             print(f"[blocked] {exp_id}: {'; '.join(missing)}")
+            _write_manifest()
             return 2
         print(f"[run] {exp_id}")
         print(cmd_to_text(cmd))
@@ -1941,7 +1960,10 @@ def main() -> int:
         assert isinstance(cmd, list)
         proc = subprocess.run(cmd, cwd=REPO_ROOT, check=False)
         if proc.returncode != 0:
+            _write_manifest()
             return proc.returncode
+    if not args.dry_run:
+        _write_manifest()
     return 0
 
 

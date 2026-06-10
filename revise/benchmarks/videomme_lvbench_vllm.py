@@ -728,8 +728,9 @@ def main() -> int:
     ap.add_argument("--max-model-len", type=int, default=12288)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.6)
 
-    ap.add_argument("--max-rounds", type=int, default=5)
-    ap.add_argument("--max-frames-per-round", type=int, default=5)
+    # Paper setting (Sec. 4 "Settings"): max_rounds=4 (T=4), max_frames_per_round=3.
+    ap.add_argument("--max-rounds", type=int, default=4)
+    ap.add_argument("--max-frames-per-round", type=int, default=3)
     ap.add_argument("--candidate-k", type=int, default=20)
     ap.add_argument("--use-candidate-frame-ids", action="store_true", default=True)
     ap.add_argument("--require-candidate-frames", action="store_true", default=True)

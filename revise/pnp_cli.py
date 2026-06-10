@@ -109,8 +109,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=12288)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
 
-    parser.add_argument("--max-rounds", type=int, default=5)
-    parser.add_argument("--max-frames-per-round", "--max-frames", type=int, default=5)
+    # Paper setting (Sec. 4 "Settings"): max_rounds=4 (T=4), max_frames_per_round=3.
+    parser.add_argument("--max-rounds", type=int, default=4)
+    parser.add_argument("--max-frames-per-round", "--max-frames", type=int, default=3)
     parser.add_argument(
         "--min-select-rounds",
         type=int,
